@@ -26,7 +26,7 @@ jobs:
 
       - name: Build (tests + PyInstaller)
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -SourceBootloader
 
       - name: SHA-256
         shell: powershell
