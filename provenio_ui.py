@@ -908,7 +908,7 @@ const TOOLS=[
  {id:"dns",cat:"Сеть и домены",ic:"🌐",tn:"DNS-записи",td:"A, AAAA, MX, NS, TXT, CNAME, SOA, CAA через DNS-over-HTTPS",ph:"example.com"},
  {id:"whois",cat:"Сеть и домены",ic:"📜",tn:"WHOIS",td:"Регистратор, даты, статусы и NS домена",ph:"example.com"},
  {id:"rdap",cat:"Сеть и домены",ic:"🗂",tn:"RDAP",td:"Структурный WHOIS для домена / IP / ASN",ph:"example.com или 8.8.8.8"},
- {id:"subdomains",cat:"Сеть и домены",ic:"🧬",tn:"Поддомены",td:"Через Certificate Transparency (crt.sh)",ph:"example.com"},
+ {id:"subdomains",cat:"Сеть и домены",ic:"🧬",tn:"Поддомены",td:"Certificate Transparency (crt.sh, certspotter) + HackerTarget",ph:"example.com"},
  {id:"ssl",cat:"Сеть и домены",ic:"🔒",tn:"TLS-сертификат",td:"Издатель, срок действия, SAN, версия TLS",ph:"example.com"},
  {id:"headers",cat:"Сеть и домены",ic:"🧱",tn:"Заголовки безопасности",td:"Оценка HTTP security-заголовков (A–F)",ph:"https://example.com"},
  {id:"reverse_dns",cat:"Сеть и домены",ic:"↩️",tn:"Обратный DNS (PTR)",td:"Имя хоста по IP-адресу",ph:"8.8.8.8"},
@@ -1131,10 +1131,11 @@ function fmtTool(id,d,body){
   h+='<div style="margin-bottom:6px">'+Object.keys(d.present).map(k=>`<span class="tag good">✓ ${esc(k)}</span>`).join("")+'</div>';
   h+='<div>'+Object.keys(d.missing).map(k=>`<span class="tag miss">✗ ${esc(k)}</span>`).join("")+'</div>';
   return h;}
- if(id==="subdomains"){const s=d.subdomains||[];return kv("Найдено",d.count)+'<div style="margin-top:8px">'+(s.length?s.slice(0,200).map(x=>`<span class="tag">${esc(x)}</span>`).join(""):'<span class="mu">нет</span>')+'</div>';}
+ if(id==="subdomains"){const s=d.subdomains||[];return kv("Найдено",d.count)+kv("Источники",(d.sources||[]).join(", "))+(Object.keys(d.errors||{}).length?kv("Недоступны",Object.keys(d.errors).join(", ")):"")+'<div style="margin-top:8px">'+(s.length?s.slice(0,200).map(x=>`<span class="tag">${esc(x)}</span>`).join(""):'<span class="mu">нет</span>')+'</div>';}
  if(id==="wayback")return kv("В архиве",d.available?"да":"нет")+kv("Снимок",d.closest?'<a class="url" target="_blank" href="'+esc(d.closest)+'">открыть</a>':"—")+kv("Дата",d.timestamp);
  if(id==="username"){const f=d.found||[];let h=`<div style="margin-bottom:8px"><span class="found">Найдено: ${f.length}</span> <span class="mu">из ${d.checked} платформ</span></div>`;
   h+=f.map(x=>`<div class="kv"><b class="found">${esc(x.site)}</b><span><a class="url" target="_blank" href="${esc(x.url)}">${esc(x.url)}</a></span></div>`).join("");
+  if((d.unreliable||[]).length)h+=`<div class="pmsg" style="margin-top:8px">⚠ Недостоверно (сайт «находит» и случайный ник): ${esc(d.unreliable.map(x=>x.site).join(", "))}</div>`;
   const ab=(d.absent||[]).length;h+=`<div class="pmsg" style="margin-top:8px">Не найдено на ${ab} сайтах · без ответа: ${(d.errors||[]).length} · ник не подходит по правилам: ${d.skipped||0}</div>`;
   if(d.note)h+=`<div class="pmsg">${esc(d.note)}</div>`;
   return h;}

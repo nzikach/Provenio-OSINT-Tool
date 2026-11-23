@@ -19,6 +19,7 @@ Provenio Tools — набор пассивных OSINT / ИБ / аналитич
 import base64
 import binascii
 import hashlib
+import html
 import ipaddress
 import json
 import math
@@ -196,22 +197,27 @@ _DOH = "https://cloudflare-dns.com/dns-query"
 _RTYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "CAA"]
 
 
+def _doh(name, rtype):
+    """Один тип DNS-записи через DNS-over-HTTPS (пусто, если записи нет или ошибка)."""
+    codes = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
+    try:
+        j = _get_json(f"{_DOH}?name={urllib.parse.quote(name)}&type={rtype}",
+                      headers={"Accept": "application/dns-json"}, timeout=10)
+        return [a.get("data", "").strip('"') for a in j.get("Answer", []) if a.get("type") == codes.get(rtype)]
+    except Exception:
+        return []
+
+
 def dns_lookup(domain):
     """DNS-over-HTTPS (Cloudflare): все основные типы записей одним махом."""
     name = _host(domain)
-    out = {}
-    for t in _RTYPES:
-        try:
-            j = _get_json(f"{_DOH}?name={urllib.parse.quote(name)}&type={t}",
-                          headers={"Accept": "application/dns-json"}, timeout=10)
-            ans = []
-            for a in j.get("Answer", []):
-                ans.append(a.get("data", "").strip('"'))
-            if ans:
-                out[t] = ans
-        except Exception:
-            pass
-    return {"domain": name, "records": out}
+
+    def one(t):
+        j = _get_json(f"{_DOH}?name={urllib.parse.quote(name)}&type={t}",
+                      headers={"Accept": "application/dns-json"}, timeout=10)
+        return [a.get("data", "").strip('"') for a in j.get("Answer", [])]
+    out = {t: ans for t, ans, err in pmap(one, _RTYPES, workers=8) if ans}
+    return {"domain": name, "records": {t: out[t] for t in _RTYPES if t in out}}
 
 
 def reverse_dns(ip):
@@ -266,13 +272,27 @@ def whois_domain(domain):
                 raw = raw2
         except Exception:
             pass
+    raw = raw.replace("\r", "")
+    # у .com/.net подробности (организация, контакты) — на сервере регистратора
+    m2 = re.search(r"^\s*Registrar WHOIS Server:\s*(\S+)", raw, re.I | re.M)
+    reg_raw = ""
+    if m2 and m2.group(1).lower() != (server or "").lower():
+        try:
+            reg_raw = query(m2.group(1), name).replace("\r", "")
+        except Exception:
+            pass
+    text = raw + "\n" + reg_raw
     fields = {}
-    for key in ("Registrar", "Creation Date", "Registry Expiry Date", "Updated Date",
-                "Registrant Organization", "Name Server", "Domain Status", "Registrar WHOIS Server"):
-        vals = re.findall(rf"^{re.escape(key)}:\s*(.+)$", raw, re.I | re.M)
+    for key in ("Registrar", "Creation Date", "Registry Expiry Date", "Registrar Registration Expiration Date",
+                "Updated Date", "Registrant Organization", "Registrant Country", "Registrant Email",
+                "Name Server", "Domain Status", "Registrar WHOIS Server", "Registrar Abuse Contact Email",
+                "DNSSEC", "created", "paid-till", "org", "registrar", "nserver", "state"):
+        vals = re.findall(rf"^\s*{re.escape(key)}:\s*(.+?)\s*$", text, re.I | re.M)
+        vals = [v for v in vals if v and not v.lower().startswith(("redacted", "please query"))]
         if vals:
-            fields[key] = sorted(set(v.strip() for v in vals))
-    return {"domain": name, "server": server, "fields": fields, "raw": raw[:8000]}
+            fields[key] = sorted(set(v.split(" ")[0] if key == "Domain Status" else v for v in vals))[:12]
+    return {"domain": name, "server": server, "registrar_server": m2.group(1) if m2 else None,
+            "fields": fields, "raw": (reg_raw or raw)[:8000]}
 
 
 def ssl_cert(host):
@@ -348,14 +368,43 @@ def http_headers(url):
 def subdomains(domain):
     """Поддомены через Certificate Transparency (crt.sh)."""
     name = _host(domain)
-    j = _get_json(f"https://crt.sh/?q={urllib.parse.quote('%.' + name)}&output=json", timeout=25)
-    subs = set()
-    for row in j:
-        for n in str(row.get("name_value", "")).splitlines():
-            n = n.strip().lstrip("*.").lower()
-            if n.endswith(name) and "@" not in n:
-                subs.add(n)
-    return {"domain": name, "count": len(subs), "subdomains": sorted(subs)[:400]}
+    subs, used, errors = set(), [], {}
+
+    def add(n):
+        n = n.strip().lstrip("*.").lower().rstrip(".")
+        if (n == name or n.endswith("." + name)) and "@" not in n and re.fullmatch(r"[a-z0-9.\-]+", n):
+            subs.add(n)
+
+    def crtsh():
+        for row in _get_json(f"https://crt.sh/?q={urllib.parse.quote('%.' + name)}&output=json", timeout=40):
+            for n in str(row.get("name_value", "")).splitlines():
+                add(n)
+
+    def certspotter():
+        for row in _get_json("https://api.certspotter.com/v1/issuances?domain=" + urllib.parse.quote(name)
+                             + "&include_subdomains=true&expand=dns_names", timeout=30):
+            for n in row.get("dns_names", []):
+                add(n)
+
+    def hackertarget():
+        _, _, _, data = _get(f"https://api.hackertarget.com/hostsearch/?q={name}", timeout=20)
+        body = data.decode("utf-8", "replace")
+        if "API count" in body or body.lower().startswith("error"):
+            raise ValueError(body[:60])
+        for line in body.splitlines():
+            add(line.split(",")[0])
+
+    for src, fn in (("crt.sh", crtsh), ("certspotter", certspotter), ("hackertarget", hackertarget)):
+        try:
+            fn()
+            used.append(src)
+        except Exception as e:
+            errors[src] = type(e).__name__
+    if not used:
+        raise ConnectionError("Все источники поддоменов недоступны: " + ", ".join(errors))
+    subs.discard(name)
+    return {"domain": name, "count": len(subs), "subdomains": sorted(subs)[:600],
+            "sources": used, "errors": errors}
 
 
 def wayback(url):
@@ -488,10 +537,27 @@ def username_search(username, sites=None, job=None):
             skipped += 1
         else:
             (found if r["exists"] else absent).append(r)
+    # Контроль: сайты, которые «находят» и заведомо несуществующий ник, отвечают одинаково на всё —
+    # их находки недостоверны. Проверяем только сайты, где ник найден.
+    import random
+    import string
+    unreliable = []
+    if found:
+        job.note("Контрольная проверка найденных…")
+        job.total(job.all + len(found))
+        n = max(8, min(len(u), 12))
+        ctrl = random.choice(string.ascii_lowercase) + "".join(
+            random.choice(string.ascii_lowercase + string.digits) for _ in range(n - 1))
+        res2 = pmap(lambda r: _check_site(r["site"], db[r["site"]], ctrl), found, job, workers=40)
+        bad = {r["site"] for r, c, err in res2 if c is not None and c["exists"]}
+        unreliable = [r for r in found if r["site"] in bad]
+        found = [r for r in found if r["site"] not in bad]
     found.sort(key=lambda x: x["site"].lower())
     return {"username": u, "found": found, "absent": [{"site": a["site"]} for a in absent],
+            "unreliable": [{"site": r["site"], "url": r["url"]} for r in unreliable],
             "errors": errors, "checked": len(names) - skipped, "skipped": skipped,
-            "note": "Возможны ложные срабатывания: откройте найденные профили и проверьте вручную."}
+            "note": "Сайты, которые «находят» и случайный несуществующий ник, вынесены в «недостоверные». "
+                    "Найденные профили всё равно откройте и проверьте вручную."}
 
 
 _RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]+@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+)$")
@@ -770,7 +836,7 @@ def site_recon(url):
     title = ""
     mt = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
     if mt:
-        title = re.sub(r"\s+", " ", mt.group(1)).strip()[:300]
+        title = html.unescape(re.sub(r"\s+", " ", mt.group(1)).strip())[:300]
 
     def meta_val(key, attr="name"):
         for m in metas:
@@ -803,7 +869,7 @@ def site_recon(url):
 
     return {
         "url": final, "status": status, "host": base, "title": title,
-        "description": meta_val("description")[:400],
+        "description": html.unescape(meta_val("description"))[:400],
         "generator": meta_val("generator"),
         "language": meta_val("content-language", "http-equiv") or re.search(
             r'<html[^>]*lang=["\']([^"\']+)', text, re.I).group(1) if re.search(
@@ -887,23 +953,23 @@ def redirect_chain(url):
 def email_security(domain):
     """Антиспуфинг-постура домена: SPF, DMARC, DKIM, MX."""
     name = _host(domain)
-    txt = dns_lookup(name)["records"].get("TXT", [])
+    txt = _doh(name, "TXT")
     spf = next((t for t in txt if "v=spf1" in t.lower()), None)
     dmarc = None
     try:
-        dt = dns_lookup("_dmarc." + name)["records"].get("TXT", [])
+        dt = _doh("_dmarc." + name, "TXT")
         dmarc = next((t for t in dt if "v=dmarc1" in t.lower()), None)
     except Exception:
         pass
-    dkim = []
-    for sel in ("default", "google", "selector1", "selector2", "k1", "dkim", "mail", "s1"):
-        try:
-            r = dns_lookup(f"{sel}._domainkey.{name}")["records"]
-            if r.get("TXT") or r.get("CNAME"):
-                dkim.append(sel)
-        except Exception:
-            pass
-    mx = dns_lookup(name)["records"].get("MX", [])
+    sels = ("default", "google", "selector1", "selector2", "k1", "k2", "k3", "dkim", "mail", "s1", "s2",
+            "smtp", "mx", "key1", "key2", "20230601", "20221208", "20210112", "20161025", "mandrill",
+            "everlytickey1", "zoho", "mailjet", "sendgrid", "s1024", "s2048", "sig1", "fm1", "fm2",
+            "protonmail", "protonmail2", "yandex", "mail-ru", "dk", "pm", "amazonses", "turbo-smtp")
+
+    def has(sel):
+        return bool(_doh(f"{sel}._domainkey.{name}", "TXT") or _doh(f"{sel}._domainkey.{name}", "CNAME"))
+    dkim = sorted(sel for sel, ok, err in pmap(has, sels, workers=16) if ok)
+    mx = _doh(name, "MX")
     score = sum([bool(spf), bool(dmarc), bool(dkim), bool(mx)])
     return {"domain": name, "spf": spf, "dmarc": dmarc, "dkim_selectors": dkim,
             "mx": mx[:6], "has_mx": bool(mx), "posture_score": f"{score}/4"}

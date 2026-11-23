@@ -75,12 +75,14 @@ def harvester(domain, job=None):
     hosts, emails, used, errors = set(), set(), [], {}
     job.total(4 + len(_CONTACT_PATHS))
 
-    job.note("Certificate Transparency (crt.sh)…")
+    job.note("Certificate Transparency (crt.sh, certspotter)…")
     try:
-        hosts |= set(T.subdomains(d)["subdomains"])
-        used.append("crt.sh")
+        sd = T.subdomains(d)
+        hosts |= set(sd["subdomains"])
+        used += sd["sources"]
+        errors.update(sd["errors"])
     except Exception as e:
-        errors["crt.sh"] = type(e).__name__
+        errors["CT-логи"] = type(e).__name__
     job.step()
 
     job.note("HackerTarget…")
@@ -101,8 +103,9 @@ def harvester(domain, job=None):
 
     job.note("Архив Wayback…")
     try:
-        _, _, _, data = T._get("http://web.archive.org/cdx/search/cdx?url=*." + d +
-                               "&fl=original&collapse=urlkey&limit=4000", timeout=30, max_bytes=4_000_000)
+        _, _, _, data = T._get("https://web.archive.org/cdx/search/cdx?url=*." + d +
+                               "&fl=original&collapse=urlkey&limit=2000", timeout=25, max_bytes=4_000_000,
+                               retries=0)
         for line in data.decode("utf-8", "replace").splitlines():
             h = T._host(line)
             if h.endswith(d) and re.fullmatch(r"[a-z0-9.\-]+", h):
@@ -138,7 +141,7 @@ def harvester(domain, job=None):
     rows = sorted(({"host": h, "ips": ips or []} for h, ips, _ in res), key=lambda r: r["host"])
     ip_count = Counter(ip for r in rows for ip in r["ips"])
     own = [e for e in emails if e.endswith("@" + d) or e.endswith("." + d)]
-    return {"domain": d, "sources": used, "errors": errors,
+    return {"domain": d, "sources": list(dict.fromkeys(used)), "errors": errors,
             "emails": sorted(own) + sorted(e for e in emails if e not in own)[:100],
             "hosts_total": len(rows), "hosts_alive": sum(1 for r in rows if r["ips"]),
             "hosts": rows, "top_ips": [{"ip": ip, "hosts": n} for ip, n in ip_count.most_common(30)]}
@@ -340,13 +343,40 @@ def wayback_urls(domain, job=None, limit=8000):
     """Все известные архиву Wayback URL домена (как gau/waymore), сгруппированные."""
     job = job or T.Job()
     d = T._host(domain)
+    rows, used, errors = [], [], {}
+    job.total(2)
     job.note("Запрос к CDX-индексу Wayback…")
-    _, _, _, data = T._get(f"http://web.archive.org/cdx/search/cdx?url={d}/*&output=json"
-                           f"&fl=original,timestamp,statuscode,mimetype&collapse=urlkey&limit={limit}",
-                           timeout=60, max_bytes=12_000_000)
-    rows = json.loads(data.decode("utf-8", "replace") or "[]")[1:]
-    urls = [r[0] for r in rows]
-    stamps = sorted(r[1] for r in rows if r[1])
+    try:
+        _, _, _, data = T._get(f"https://web.archive.org/cdx/search/cdx?url={d}/*&output=json"
+                               f"&fl=original,timestamp&collapse=urlkey&limit={min(limit, 5000)}",
+                               timeout=30, max_bytes=12_000_000, retries=0)
+        rows = [(r[0], r[1]) for r in json.loads(data.decode("utf-8", "replace") or "[]")[1:]]
+        used.append("Wayback")
+    except Exception as e:
+        errors["Wayback"] = type(e).__name__
+    job.step()
+    job.note("AlienVault OTX…")
+    try:
+        for page in range(1, 6):
+            j = T._get_json(f"https://otx.alienvault.com/api/v1/indicators/domain/{d}/url_list"
+                            f"?limit=500&page={page}", timeout=25)
+            for x in j.get("url_list", []):
+                ts = re.sub(r"\D", "", x.get("date") or "")[:14]
+                rows.append((x.get("url"), ts))
+            if not j.get("has_next"):
+                break
+        used.append("AlienVault OTX")
+    except Exception as e:
+        errors["AlienVault OTX"] = type(e).__name__
+    job.step()
+    if not used:
+        raise ConnectionError("Wayback и OTX недоступны: " + ", ".join(f"{k}: {v}" for k, v in errors.items()))
+    seen = {}
+    for u, ts in rows:
+        if u and u not in seen:
+            seen[u] = ts
+    urls = list(seen)
+    stamps = sorted(t for t in seen.values() if t)
     groups = {}
     for name, rx in _URL_GROUPS:
         groups[name] = [u for u in urls if re.search(rx, u, re.I)][:300]
@@ -355,7 +385,7 @@ def wayback_urls(domain, job=None, limit=8000):
         for k in urllib.parse.parse_qs(urllib.parse.urlparse(u).query):
             params[k] += 1
     subs = Counter(T._host(u) for u in urls)
-    return {"domain": d, "total": len(urls),
+    return {"domain": d, "total": len(urls), "sources": used, "errors": errors,
             "first_seen": stamps[0] if stamps else None, "last_seen": stamps[-1] if stamps else None,
             "groups": {k: v for k, v in groups.items() if v},
             "params": [{"param": k, "count": n} for k, n in params.most_common(60)],
@@ -1121,6 +1151,11 @@ def cve_lookup(q, job=None):
         url = base + "resultsPerPage=25&keywordSearch=" + urllib.parse.quote(q)
     job.note("Запрос к NVD…")
     j = T._get_json(url, timeout=40)
+    m = re.fullmatch(r"([A-Za-z0-9_.\-]+)[ /:]+v?(\d[\w.\-]*)", q)
+    if not j.get("vulnerabilities") and m:
+        job.note("Поиск по CPE (продукт и версия)…")
+        cpe = f"cpe:2.3:*:*:{m.group(1).lower()}:{m.group(2)}"
+        j = T._get_json(base + "resultsPerPage=50&virtualMatchString=" + urllib.parse.quote(cpe), timeout=40)
     kev = _kev()
     items = []
     for v in j.get("vulnerabilities", []):
