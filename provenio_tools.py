@@ -28,24 +28,155 @@ import ssl
 import urllib.parse
 import urllib.request
 import urllib.error
+import os
+import time
+import sys
+import threading
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 UA = "Mozilla/5.0 (compatible; Provenio/2.0; +OSINT-research)"
+# для проверки профилей нужен «браузерный» UA: многие сайты режут ботов кодом 403
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 TIMEOUT = 15
+SETTINGS = {"proxy": "", "timeout": 15, "keys": {}}
+
+
+def configure(settings):
+    """Применяет настройки: прокси для всех HTTP-запросов, таймаут, API-ключи."""
+    global TIMEOUT
+    SETTINGS.update(settings or {})
+    TIMEOUT = int(SETTINGS.get("timeout") or 15)
+    proxy = (SETTINGS.get("proxy") or "").strip()
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    urllib.request.install_opener(urllib.request.build_opener(*handlers))
+
+
+def key(name):
+    return ((SETTINGS.get("keys") or {}).get(name) or "").strip()
+
+
+# ----------------------------------------------------------------- задачи с прогрессом
+class Cancelled(Exception):
+    pass
+
+
+class Job:
+    """Прогресс и отмена для долгих инструментов. Инструмент вызывает
+    job.total(n) / job.step(msg) / job.check(); интерфейс опрашивает состояние."""
+
+    def __init__(self):
+        self.done = 0
+        self.all = 0
+        self.msg = ""
+        self.cancelled = False
+        self.partial = None
+        self._lock = threading.Lock()
+
+    def total(self, n):
+        self.all = n
+
+    def step(self, msg=None, n=1):
+        with self._lock:
+            self.done += n
+            if msg:
+                self.msg = msg
+        self.check()
+
+    def note(self, msg):
+        self.msg = msg
+        self.check()
+
+    def check(self):
+        if self.cancelled:
+            raise Cancelled("Остановлено пользователем")
+
+
+NULL_JOB = Job()
+
+
+def pmap(fn, items, job=None, workers=16):
+    """Параллельно применяет fn к items. Ошибки отдельных элементов не роняют всё.
+    Возвращает список (item, result|None, error|None) в порядке завершения."""
+    job = job or Job()
+    items = list(items)
+    out = []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(items) or 1))) as ex:
+        futs = {ex.submit(fn, it): it for it in items}
+        try:
+            for f in as_completed(futs):
+                it = futs[f]
+                try:
+                    out.append((it, f.result(), None))
+                except Exception as e:
+                    out.append((it, None, f"{type(e).__name__}: {str(e)[:120]}"))
+                job.step()
+        except Cancelled:
+            for f in futs:
+                f.cancel()
+            raise
+    return out
+
+
+def res_path(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 # ----------------------------------------------------------------- HTTP helpers
-def _get(url, headers=None, timeout=TIMEOUT, max_bytes=2_000_000):
+def _open(req, timeout, insecure=False):
+    """urlopen с учётом прокси из настроек. insecure=True — без проверки сертификата
+    (только как запасной вариант для сайтов с неполной цепочкой сертификатов)."""
+    handlers = []
+    proxy = (SETTINGS.get("proxy") or "").strip()
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if insecure:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+
+
+def _is_cert_error(e):
+    return isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError) or         isinstance(e, ssl.SSLCertVerificationError)
+
+
+def _get(url, headers=None, timeout=None, max_bytes=2_000_000, retries=1):
+    """GET с таймаутом, одним повтором при 502/503/504/таймауте и запасным
+    режимом без проверки сертификата (только чтение публичных данных)."""
+    timeout = timeout or TIMEOUT
     h = {"User-Agent": UA, "Accept": "*/*"}
     if headers:
         h.update(headers)
-    req = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = r.read(max_bytes)
-        return r.status, dict(r.headers), r.geturl(), data
+    insecure = False
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with _open(req, timeout, insecure) as r:
+                data = r.read(max_bytes)
+                return r.status, dict(r.headers), r.geturl(), data
+        except urllib.error.HTTPError as e:
+            if e.code in (502, 503, 504, 429) and attempt < retries:
+                time.sleep(1.5)
+                continue
+            raise
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError, socket.timeout) as e:
+            if _is_cert_error(e) and not insecure:
+                insecure = True
+                try:
+                    with _open(req, timeout, True) as r:
+                        data = r.read(max_bytes)
+                        return r.status, dict(r.headers), r.geturl(), data
+                except Exception:
+                    raise e
+            if isinstance(e, (TimeoutError, socket.timeout)) and attempt < retries:
+                continue
+            raise
 
 
-def _get_json(url, headers=None, timeout=TIMEOUT):
+def _get_json(url, headers=None, timeout=None):
     hh = {"Accept": "application/json"}
     if headers:
         hh.update(headers)
@@ -272,28 +403,95 @@ _USER_SITES = [
 ]
 
 
-def username_search(username, sites=None):
-    """Ищет публичные профили с данным ником. Возвращает найденные/не найденные."""
+_SITES_CACHE = None
+
+
+def load_sites():
+    """База сайтов (Sherlock Project, MIT) + собственные 20 проверок как запасной вариант."""
+    global _SITES_CACHE
+    if _SITES_CACHE is None:
+        sites = {}
+        try:
+            with open(res_path("provenio_sites.json"), encoding="utf-8") as f:
+                sites = json.load(f)["sites"]
+        except (OSError, ValueError, KeyError):
+            pass
+        hosts = {_host(s["url"]).removeprefix("www.") for s in sites.values()}
+        for name, tmpl, miss in _USER_SITES:
+            if _host(tmpl).removeprefix("www.") not in hosts:
+                sites.setdefault(name, {"url": tmpl.replace("{u}", "{}"), "main": tmpl.split("{u}")[0],
+                                        "type": "status_code"})
+        _SITES_CACHE = sites
+    return _SITES_CACHE
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _check_site(name, site, u):
+    """Проверка одного сайта по правилам Sherlock: status_code / message / response_url."""
+    if site.get("regex") and not re.search(site["regex"], u):
+        return None   # ник не подходит под правила сайта
+    url = site["url"].replace("{}", u)
+    probe = (site.get("probe") or site["url"]).replace("{}", u)
+    kind = site.get("type", "status_code")
+    headers = {"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+               "Accept-Language": "en-US,en;q=0.8"}
+    headers.update(site.get("headers") or {})
+    method = site.get("method") or ("GET" if kind == "message" else "GET")
+    req = urllib.request.Request(probe, headers=headers, method=method)
+    opener = (urllib.request.build_opener(_NoRedirect) if kind == "response_url"
+              else urllib.request.build_opener())
+    proxy = (SETTINGS.get("proxy") or "").strip()
+    if proxy:
+        opener.add_handler(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    body = ""
+    try:
+        with opener.open(req, timeout=10) as r:
+            code = r.status
+            if kind == "message":
+                body = r.read(400_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as he:
+        code = he.code
+        if kind == "message":
+            try:
+                body = he.read(400_000).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+    if kind == "status_code":
+        exists = 200 <= code < 300 and code not in (site.get("codes") or [])
+    elif kind == "message":
+        exists = 200 <= code < 400 and not any(m in body for m in site.get("msg", []))
+    else:  # response_url: профиль есть, если нет редиректа на страницу ошибки
+        exists = 200 <= code < 300
+    return {"site": name, "url": url, "code": code, "exists": exists}
+
+
+def username_search(username, sites=None, job=None):
+    """Ищет публичные профили с данным ником на ~460 сайтах (параллельно).
+    Это не перебор: один запрос на сайт, смотрим код ответа / строку-маркер."""
     u = re.sub(r"[^\w.\-]", "", username.strip())[:40]
     if not u:
         raise ValueError("Пустой ник")
-    found, absent, errors = [], [], []
-    for name, tmpl, miss in (sites or _USER_SITES):
-        url = tmpl.format(u=u)
-        try:
-            req = urllib.request.Request(url, method="HEAD" if miss == 404 else "GET",
-                                         headers={"User-Agent": UA})
-            try:
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    code = r.status
-            except urllib.error.HTTPError as he:
-                code = he.code
-            exists = (code == 200) if miss == 404 else (code in (200, 301, 302))
-            (found if exists else absent).append({"site": name, "url": url, "code": code})
-        except Exception as e:
-            errors.append({"site": name, "url": url, "err": type(e).__name__})
-    return {"username": u, "found": found, "absent": absent,
-            "errors": errors, "checked": len(sites or _USER_SITES)}
+    job = job or Job()
+    db = load_sites()
+    names = sites or sorted(db, key=str.lower)
+    job.total(len(names))
+    res = pmap(lambda n: _check_site(n, db[n], u), names, job, workers=40)
+    found, absent, errors, skipped = [], [], [], 0
+    for name, r, err in res:
+        if err:
+            errors.append({"site": name, "err": err})
+        elif r is None:
+            skipped += 1
+        else:
+            (found if r["exists"] else absent).append(r)
+    found.sort(key=lambda x: x["site"].lower())
+    return {"username": u, "found": found, "absent": [{"site": a["site"]} for a in absent],
+            "errors": errors, "checked": len(names) - skipped, "skipped": skipped,
+            "note": "Возможны ложные срабатывания: откройте найденные профили и проверьте вручную."}
 
 
 _RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]+@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+)$")
@@ -1019,7 +1217,7 @@ TOOLS = {
     "security_txt": lambda p: security_txt(p["q"]),
     "favicon": lambda p: favicon_hash(p["q"]),
     # OSINT: люди
-    "username": lambda p: username_search(p["q"]),
+    "username": lambda p: username_search(p["q"], job=p.get("_job")),
     "email": lambda p: email_recon(p["q"]),
     "phone": lambda p: phone_info(p["q"]),
     # ИБ (защита)
@@ -1049,7 +1247,9 @@ def _tech_only(url):
             "technologies": _detect_tech(low, text)}
 
 
-def run_tool(name, params):
+def run_tool(name, params, job=None):
     if name not in TOOLS:
-        raise KeyError(name)
+        raise KeyError(f"Неизвестный инструмент: {name}")
+    params = dict(params)
+    params["_job"] = job or Job()
     return TOOLS[name](params)

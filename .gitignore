@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 venv/
 
+# Сборка exe
+build/
+dist/
+*.spec
+
 # Локальные данные кейсов (база и снимки) — не публикуем
 provenio_data/
 

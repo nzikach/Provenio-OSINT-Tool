@@ -18,7 +18,13 @@ import sqlite3
 import hashlib
 import re
 import os
+import io
 import sys
+import json
+import time
+import shutil
+import zipfile
+import difflib
 import threading
 import ipaddress
 import math
@@ -32,13 +38,41 @@ import urllib.error
 from html.parser import HTMLParser
 
 APP_NAME = "Provenio"
-BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                           else os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "provenio_data")
+APP_VERSION = "2.0.0"
+FROZEN = getattr(sys, "frozen", False)
+BASE_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+# каталог с ресурсами (в exe PyInstaller распаковывает их во временную папку)
+RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+
+def _default_data_dir():
+    """Данные храним в профиле пользователя: exe может лежать в Program Files,
+    куда писать нельзя. PROVENIO_DATA позволяет переопределить путь (тесты, флешка)."""
+    env = os.environ.get("PROVENIO_DATA")
+    if env:
+        return env
+    root = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(root, APP_NAME)
+
+
+DATA_DIR = _default_data_dir()
+LEGACY_DIR = os.path.join(BASE_DIR, "provenio_data")   # где данные лежали в версии 1.x
 SNAP_DIR = os.path.join(DATA_DIR, "snapshots")
 DB_PATH = os.path.join(DATA_DIR, "provenio.db")
-USER_AGENT = "Mozilla/5.0 (compatible; Provenio/1.0; +OSINT-research)"
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
+USER_AGENT = f"Mozilla/5.0 (compatible; Provenio/{APP_VERSION}; +OSINT-research)"
 MAX_BYTES = 5 * 1024 * 1024
+
+
+def migrate_legacy():
+    """Однократно копирует данные версии 1.x (рядом со скриптом) в новый каталог.
+    Копируем, а не переносим: старая папка остаётся нетронутой как резервная."""
+    if os.path.exists(DB_PATH) or not os.path.isfile(os.path.join(LEGACY_DIR, "provenio.db")):
+        return False
+    if os.path.abspath(LEGACY_DIR) == os.path.abspath(DATA_DIR):
+        return False
+    shutil.copytree(LEGACY_DIR, DATA_DIR, dirs_exist_ok=True)
+    return True
 
 SOCIAL = {
     "twitter.com": "twitter", "x.com": "twitter", "github.com": "github",
@@ -52,6 +86,19 @@ GENERIC_SEGMENTS = {"", "share", "intent", "sharer", "sharer.php", "home", "logi
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 RE_PHONE = re.compile(r"\+\d[\d\s().\-]{8,16}\d")
 RE_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+RE_DOMAIN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b")
+RE_URL = re.compile(r"https?://[^\s\"'<>]+", re.I)
+# «домены», которые на деле расширения файлов, и служебные сервисы самих инструментов
+FILE_EXT = {"js", "css", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "json", "html", "htm",
+            "php", "asp", "aspx", "jsp", "xml", "txt", "pdf", "zip", "gz", "rar", "exe", "dll", "py",
+            "md", "csv", "log", "bak", "sql", "env", "map", "woff", "woff2", "ttf", "mp4", "mp3", "doc",
+            "docx", "xls", "xlsx", "ppt", "pptx", "yml", "yaml", "ini", "conf", "cfg", "sh", "bat", "local"}
+SERVICE_HOSTS = {"shodan.io", "google.com", "lens.google.com", "bing.com", "yandex.com", "yandex.ru",
+                 "tineye.com", "archive.org", "web.archive.org", "crt.sh", "gravatar.com",
+                 "builtwith.com", "publicwww.com", "virustotal.com", "urlscan.io", "otx.alienvault.com",
+                 "nvd.nist.gov", "blockstream.info", "eth.blockscout.com", "stat.ripe.net",
+                 "internetdb.shodan.io", "rdap.org", "cloudflare-dns.com", "api.github.com",
+                 "spyonweb.com", "dnslytics.com", "hackertarget.com", "api.hackertarget.com"}
 
 
 # ----------------------------------------------------------------- утилиты
@@ -141,24 +188,83 @@ def extract_entities(html_text, base_url):
     found.add(("domain", own))
     for href in p.links:
         full = urllib.parse.urljoin(base_url, href)
-        pr = urllib.parse.urlparse(full)
-        if pr.scheme not in ("http", "https"):
-            continue
-        h = host_of(full)
-        if not h or h == own:
-            continue
-        if h in SOCIAL:
-            seg = pr.path.strip("/").split("/")[0].lstrip("@")
-            if seg.lower() not in GENERIC_SEGMENTS:
-                found.add(("account", f"{SOCIAL[h]}:{seg}"))
-        else:
-            found.add(("domain", h))
+        if host_of(full) != own:
+            found |= url_entities(full)
     return found, " ".join(p.title.split())[:300]
+
+
+def url_entities(url):
+    """Сущности из одного URL: аккаунт соцсети или домен."""
+    pr = urllib.parse.urlparse(url)
+    if pr.scheme not in ("http", "https"):
+        return set()
+    h = host_of(url)
+    if not h:
+        return set()
+    if h in SOCIAL:
+        seg = pr.path.strip("/").split("/")[0].lstrip("@")
+        if seg and seg.lower() not in GENERIC_SEGMENTS:
+            return {("account", f"{SOCIAL[h]}:{seg}")}
+        return set()
+    if h in SERVICE_HOSTS or any(h.endswith("." + s) for s in SERVICE_HOSTS):
+        return set()
+    try:
+        ipaddress.ip_address(h)
+        return {("ip", h)}
+    except ValueError:
+        return {("domain", h)} if "." in h else set()
+
+
+def _strings(data, out, limit=5000):
+    """Все строковые значения из вложенной структуры (ключи не берём)."""
+    if len(out) >= limit:
+        return out
+    if isinstance(data, dict):
+        for v in data.values():
+            _strings(v, out, limit)
+    elif isinstance(data, (list, tuple)):
+        for v in data:
+            _strings(v, out, limit)
+    elif isinstance(data, str):
+        out.append(data)
+    return out
+
+
+def extract_entities_data(data, cap=500):
+    """Сущности из результата инструмента (dict/list): email, IP, телефоны, домены, аккаунты."""
+    found = set()
+    for s in _strings(data, []):
+        if len(found) >= cap:
+            break
+        low = s.lower()
+        for m in RE_EMAIL.findall(s):
+            found.add(("email", m.lower().strip(".")))
+        for m in RE_URL.findall(s):
+            found |= url_entities(m.rstrip(".,);]"))
+        for m in RE_IP.findall(s):
+            try:
+                if ipaddress.ip_address(m).is_global:
+                    found.add(("ip", m))
+            except ValueError:
+                pass
+        if s.startswith("+") and RE_PHONE.fullmatch(s.strip()):
+            found.add(("phone", "+" + re.sub(r"\D", "", s)))
+        # «голые» домены — только если строка целиком похожа на хост
+        cand = low.strip().rstrip(".")
+        if len(cand) < 254 and RE_DOMAIN.fullmatch(cand):
+            tld = cand.rsplit(".", 1)[-1]
+            if tld not in FILE_EXT and cand not in SERVICE_HOSTS:
+                found.add(("domain", cand[4:] if cand.startswith("www.") else cand))
+    return found
 
 
 # ----------------------------------------------------------------- хранилище
 class Store:
-    def __init__(self, path=DB_PATH, snap_dir=SNAP_DIR):
+    def __init__(self, path=None, snap_dir=None):
+        if path is None:
+            migrate_legacy()
+        path = path or DB_PATH
+        snap_dir = snap_dir or SNAP_DIR
         os.makedirs(os.path.dirname(path), exist_ok=True)
         os.makedirs(snap_dir, exist_ok=True)
         self.snap_dir = snap_dir
@@ -179,7 +285,19 @@ class Store:
         CREATE TABLE IF NOT EXISTS audit(
             id INTEGER PRIMARY KEY, ts TEXT, action TEXT, detail TEXT,
             prev TEXT, hash TEXT);
+        CREATE TABLE IF NOT EXISTS monitors(
+            source_id INTEGER PRIMARY KEY, case_id INTEGER, interval_min INTEGER,
+            last_check TEXT DEFAULT '', next_ts REAL DEFAULT 0, changes INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS notifications(
+            id INTEGER PRIMARY KEY, ts TEXT, case_id INTEGER, text TEXT, seen INTEGER DEFAULT 0);
         """)
+        # миграция схемы 1.x -> 2.x: новые поля источников
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(sources)")}
+        for name, decl in (("kind", "TEXT DEFAULT 'web'"), ("tool", "TEXT DEFAULT ''"),
+                           ("query", "TEXT DEFAULT ''"), ("parent_id", "INTEGER"),
+                           ("ctype", "TEXT DEFAULT 'text/html'")):
+            if name not in have:
+                self.db.execute(f"ALTER TABLE sources ADD COLUMN {name} {decl}")
         self.db.commit()
 
     # --- аудит с хэш-цепочкой
@@ -194,17 +312,15 @@ class Store:
             self.db.commit()
 
     def verify_audit(self):
-        prev = "GENESIS"
-        for r in self.db.execute("SELECT * FROM audit ORDER BY id"):
-            expect = sha256_bytes(f"{prev}|{r['ts']}|{r['action']}|{r['detail']}".encode())
-            if r["prev"] != prev or r["hash"] != expect:
-                return False, r["id"]
-            prev = r["hash"]
-        return True, None
+        return verify_chain(dict(r) for r in self.db.execute("SELECT * FROM audit ORDER BY id"))
 
     # --- кейсы
     def cases(self):
         return [dict(r) for r in self.db.execute("SELECT * FROM cases ORDER BY id")]
+
+    def case(self, cid):
+        r = self.db.execute("SELECT * FROM cases WHERE id=?", (int(cid),)).fetchone()
+        return dict(r) if r else None
 
     def add_case(self, name):
         with self.lock:
@@ -218,48 +334,107 @@ class Store:
 
     # --- источники
     def fetch(self, url):
+        """Загрузка страницы. Если сайт отдаёт неполную цепочку сертификатов, страница
+        всё равно архивируется, но в статусе честно помечается «TLS не проверен»."""
+        import ssl
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
                                                    "Accept": "text/html,*/*;q=0.8"})
-        with urllib.request.urlopen(req, timeout=25) as r:
+        note = ""
+        try:
+            r = urllib.request.urlopen(req, timeout=25)
+        except urllib.error.URLError as e:
+            if not isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+                raise
+            handlers = [urllib.request.HTTPSHandler(context=ssl._create_unverified_context())]
+            proxy = load_settings().get("proxy")
+            if proxy:
+                handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            r = urllib.request.build_opener(*handlers).open(req, timeout=25)
+            note = " (TLS не проверен)"
+        with r:
             data = r.read(MAX_BYTES + 1)
             charset = r.headers.get_content_charset() or "utf-8"
-            return r.status, r.geturl(), data[:MAX_BYTES], charset
+            return f"{r.status}{note}", r.geturl(), data[:MAX_BYTES], charset
 
-    def add_source(self, case_id, url):
+    def _save_snapshot(self, data, ext):
+        digest = sha256_bytes(data)
+        fname = f"{digest[:16]}.{ext}"
+        with open(os.path.join(self.snap_dir, fname), "wb") as f:
+            f.write(data)
+        return digest, fname
+
+    def _link_entities(self, case_id, sid, ents):
+        for t, v in ents:
+            self.db.execute("INSERT OR IGNORE INTO entities(case_id,type,value) VALUES(?,?,?)",
+                            (case_id, t, v))
+            eid = self.db.execute(
+                "SELECT id FROM entities WHERE case_id=? AND type=? AND value=?",
+                (case_id, t, v)).fetchone()["id"]
+            self.db.execute("INSERT OR IGNORE INTO links VALUES(?,?)", (eid, sid))
+
+    def add_source(self, case_id, url, parent_id=None):
         url = normalize_url(url)
         fetched = now_iso()
         try:
             status, final, data, charset = self.fetch(url)
-            digest = sha256_bytes(data)
-            fname = f"{digest[:16]}.html"
-            with open(os.path.join(self.snap_dir, fname), "wb") as f:
-                f.write(data)
+            digest, snap = self._save_snapshot(data, "html")
             text = data.decode(charset, errors="replace")
             ents, title = extract_entities(text, final)
-            status_s, size, snap = f"OK {status}", len(data), fname
+            status_s, size = f"OK {status}", len(data)
         except Exception as e:  # сеть, SSL, таймаут, HTTP-ошибка
             final, digest, size, snap, title, ents = url, "", 0, "", "", set()
             status_s = f"ERR: {type(e).__name__} {str(e)[:80]}"
         with self.lock:
+            rel = 3
+            if parent_id:
+                p = self.db.execute("SELECT reliability FROM sources WHERE id=?", (parent_id,)).fetchone()
+                rel = p["reliability"] if p else 3
             cur = self.db.execute(
-                "INSERT INTO sources(case_id,url,final_url,fetched,status,title,sha256,size,snapshot)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
-                (case_id, url, final, fetched, status_s, title, digest, size, snap))
+                "INSERT INTO sources(case_id,url,final_url,fetched,status,title,sha256,size,snapshot,"
+                "reliability,kind,parent_id,ctype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (case_id, url, final, fetched, status_s, title, digest, size, snap, rel,
+                 "web", parent_id, "text/html"))
             sid = cur.lastrowid
-            for t, v in ents:
-                self.db.execute("INSERT OR IGNORE INTO entities(case_id,type,value) VALUES(?,?,?)",
-                                (case_id, t, v))
-                eid = self.db.execute(
-                    "SELECT id FROM entities WHERE case_id=? AND type=? AND value=?",
-                    (case_id, t, v)).fetchone()["id"]
-                self.db.execute("INSERT OR IGNORE INTO links VALUES(?,?)", (eid, sid))
+            self._link_entities(case_id, sid, ents)
             self.db.commit()
-            self.audit("source_added", f"{url} | {status_s} | sha256={digest or '-'}")
+            self.audit("source_added" if not parent_id else "source_version",
+                       f"{url} | {status_s} | sha256={digest or '-'}"
+                       + (f" | parent={parent_id}" if parent_id else ""))
         return sid, status_s
 
+    def add_tool_result(self, case_id, tool, query, data, title="", pivot=None):
+        """Результат любого инструмента -> доказательство: JSON-снимок с SHA-256,
+        извлечённые сущности, запись в журнале аудита. pivot=(тип, значение) —
+        сущность, от которой запускали инструмент (связывается с результатом)."""
+        payload = {"tool": tool, "query": query, "collected": now_iso(),
+                   "app": f"{APP_NAME} {APP_VERSION}", "result": data}
+        raw = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        digest, snap = self._save_snapshot(raw, "json")
+        ents = extract_entities_data(data)
+        if pivot:
+            ents.add(tuple(pivot))
+        url = f"tool://{tool}/{urllib.parse.quote(str(query), safe='')}"
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO sources(case_id,url,final_url,fetched,status,title,sha256,size,snapshot,"
+                "kind,tool,query,ctype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (case_id, url, url, payload["collected"], "OK tool", title or f"{tool}: {query}",
+                 digest, len(raw), snap, "tool", tool, str(query), "application/json"))
+            sid = cur.lastrowid
+            self._link_entities(case_id, sid, ents)
+            self.db.commit()
+            self.audit("tool_result_added", f"{tool} | {query} | sha256={digest} | entities={len(ents)}")
+        return sid, len(ents)
+
     def sources(self, case_id):
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM sources WHERE case_id=? ORDER BY id", (case_id,))]
+        with self.lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT * FROM sources WHERE case_id=? ORDER BY id", (case_id,))]
+
+    def source(self, sid):
+        with self.lock:
+            r = self.db.execute("SELECT * FROM sources WHERE id=?", (int(sid),)).fetchone()
+        return dict(r) if r else None
 
     def update_source(self, sid, reliability=None, note=None):
         with self.lock:
@@ -273,21 +448,30 @@ class Store:
     def delete_source(self, sid):
         with self.lock:
             self.db.execute("DELETE FROM links WHERE source_id=?", (sid,))
+            self.db.execute("DELETE FROM monitors WHERE source_id=?", (sid,))
+            self.db.execute("UPDATE sources SET parent_id=NULL WHERE parent_id=?", (sid,))
             self.db.execute("DELETE FROM sources WHERE id=?", (sid,))
+            # сущности, которые больше ни на что не ссылаются, тоже убираем
+            self.db.execute("DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM links)")
             self.db.commit()
             self.audit("source_deleted", f"id={sid}")
+
+    def snapshot_bytes(self, s):
+        if not s or not s.get("snapshot"):
+            return None
+        try:
+            with open(os.path.join(self.snap_dir, s["snapshot"]), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
     def verify_snapshots(self, case_id):
         bad, ok = [], 0
         for s in self.sources(case_id):
             if not s["snapshot"]:
                 continue
-            p = os.path.join(self.snap_dir, s["snapshot"])
-            try:
-                with open(p, "rb") as f:
-                    good = sha256_bytes(f.read()) == s["sha256"]
-            except OSError:
-                good = False
+            data = self.snapshot_bytes(s)
+            good = data is not None and sha256_bytes(data) == s["sha256"]
             ok += good
             if not good:
                 bad.append(s["url"])
@@ -295,6 +479,10 @@ class Store:
 
     # --- сущности и достоверность
     def entities(self, case_id):
+        with self.lock:
+            return self._entities(case_id)
+
+    def _entities(self, case_id):
         out = []
         rows = self.db.execute("SELECT * FROM entities WHERE case_id=? ORDER BY type,value",
                                (case_id,)).fetchall()
@@ -304,6 +492,146 @@ class Store:
                 "WHERE l.entity_id=?", (e["id"],))]
             out.append({"id": e["id"], "type": e["type"], "value": e["value"],
                         "sources": srcs, "confidence": confidence(srcs)})
+        return out
+
+    # --- версии и мониторинг изменений
+    def root_of(self, sid):
+        s = self.source(sid)
+        while s and s.get("parent_id"):
+            p = self.source(s["parent_id"])
+            if not p:
+                break
+            s = p
+        return s
+
+    def versions(self, sid):
+        root = self.root_of(sid)
+        if not root:
+            return []
+        rows = [root] + [dict(r) for r in self.db.execute(
+            "SELECT * FROM sources WHERE parent_id=? ORDER BY id", (root["id"],))]
+        return rows
+
+    def set_monitor(self, sid, interval_min):
+        s = self.root_of(sid)
+        if not s or s["kind"] != "web":
+            raise ValueError("Следить можно только за веб-источником")
+        with self.lock:
+            if not interval_min:
+                self.db.execute("DELETE FROM monitors WHERE source_id=?", (s["id"],))
+                self.audit("monitor_off", f"id={s['id']}")
+            else:
+                iv = max(5, int(interval_min))
+                self.db.execute(
+                    "INSERT INTO monitors(source_id,case_id,interval_min,next_ts) VALUES(?,?,?,?) "
+                    "ON CONFLICT(source_id) DO UPDATE SET interval_min=excluded.interval_min, "
+                    "next_ts=excluded.next_ts", (s["id"], s["case_id"], iv, time.time() + iv * 60))
+                self.audit("monitor_on", f"id={s['id']} every {iv} min")
+            self.db.commit()
+
+    def monitors(self, case_id=None):
+        q = "SELECT * FROM monitors" + (" WHERE case_id=?" if case_id else "")
+        return [dict(r) for r in self.db.execute(q, (case_id,) if case_id else ())]
+
+    def check_monitor(self, sid):
+        """Переснимает источник. Если видимый текст изменился — сохраняет новую версию."""
+        root = self.root_of(sid)
+        if not root:
+            return None
+        last = self.versions(root["id"])[-1]
+        old_text = snapshot_text(self.snapshot_bytes(last), last.get("ctype"))
+        new_sid, status = self.add_source(root["case_id"], root["url"], parent_id=root["id"])
+        new = self.source(new_sid)
+        changed = None
+        if status.startswith("OK"):
+            new_text = snapshot_text(self.snapshot_bytes(new), "text/html")
+            changed = new_text != old_text
+        with self.lock:
+            if changed is False:
+                # не изменилось — новую копию не держим, пишем только факт проверки
+                self.db.execute("DELETE FROM links WHERE source_id=?", (new_sid,))
+                self.db.execute("DELETE FROM sources WHERE id=?", (new_sid,))
+                self.db.execute("DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM links)")
+                if new.get("snapshot") and new["snapshot"] != last.get("snapshot"):
+                    in_use = self.db.execute("SELECT 1 FROM sources WHERE snapshot=?",
+                                             (new["snapshot"],)).fetchone()
+                    if not in_use:
+                        try:
+                            os.remove(os.path.join(self.snap_dir, new["snapshot"]))
+                        except OSError:
+                            pass
+                self.audit("monitor_check", f"id={root['id']} без изменений")
+            elif changed:
+                self.db.execute("UPDATE monitors SET changes=changes+1 WHERE source_id=?", (root["id"],))
+                self.notify(root["case_id"], f"Изменилась страница: {root['url']} (версия #{new_sid})")
+            else:
+                self.notify(root["case_id"], f"Не удалось проверить {root['url']}: {status}")
+            self.db.execute("UPDATE monitors SET last_check=?, next_ts=? WHERE source_id=?",
+                            (now_iso(), time.time() + self._interval(root["id"]) * 60, root["id"]))
+            self.db.commit()
+        return {"changed": changed, "version": new_sid if changed else None, "status": status}
+
+    def _interval(self, sid):
+        r = self.db.execute("SELECT interval_min FROM monitors WHERE source_id=?", (sid,)).fetchone()
+        return r["interval_min"] if r else 60
+
+    def due_monitors(self):
+        return [r["source_id"] for r in self.db.execute(
+            "SELECT source_id FROM monitors WHERE next_ts<=?", (time.time(),))]
+
+    def notify(self, case_id, text):
+        with self.lock:
+            self.db.execute("INSERT INTO notifications(ts,case_id,text) VALUES(?,?,?)",
+                            (now_iso(), case_id, text))
+            self.db.commit()
+
+    def pop_notifications(self):
+        with self.lock:
+            rows = [dict(r) for r in self.db.execute(
+                "SELECT * FROM notifications WHERE seen=0 ORDER BY id")]
+            self.db.execute("UPDATE notifications SET seen=1 WHERE seen=0")
+            self.db.commit()
+        return rows
+
+    # --- сравнение снимков
+    def diff(self, sid_a, sid_b, context=2):
+        a, b = self.source(sid_a), self.source(sid_b)
+        if not a or not b:
+            raise ValueError("Источник не найден")
+        la = snapshot_text(self.snapshot_bytes(a), a.get("ctype")).splitlines()
+        lb = snapshot_text(self.snapshot_bytes(b), b.get("ctype")).splitlines()
+        return {"a": a["id"], "b": b["id"], **diff_lines(la, lb, context)}
+
+    # --- хронология кейса
+    def timeline(self, case_id):
+        events = []
+        for s in self.sources(case_id):
+            kind = "tool" if s.get("kind") == "tool" else "archive"
+            events.append({"date": iso_from_store(s["fetched"]), "kind": kind, "source": s["id"],
+                           "label": ("Результат инструмента: " if kind == "tool" else
+                                     "Версия страницы: " if s.get("parent_id") else "Архивирован: ")
+                           + (s["title"] or s["url"])[:120]})
+            data = self.snapshot_bytes(s)
+            if not data:
+                continue
+            if s.get("ctype") == "application/json":
+                try:
+                    payload = json.loads(data.decode("utf-8"))
+                except ValueError:
+                    continue
+                for path, d in dates_in(payload.get("result")):
+                    events.append({"date": d, "kind": "fact", "source": s["id"],
+                                   "label": f"{s.get('tool')} {s.get('query')}: {path}"})
+            else:
+                for label_, d in html_dates(data.decode("utf-8", "replace")):
+                    events.append({"date": d, "kind": "fact", "source": s["id"],
+                                   "label": f"{label_} — {host_of(s['url'])}"})
+        seen, out = set(), []
+        for e in sorted(events, key=lambda e: e["date"]):
+            k = (e["date"], e["label"])
+            if k not in seen:
+                seen.add(k)
+                out.append(e)
         return out
 
 
@@ -324,6 +652,295 @@ def label(score):
     return "высокая" if score >= 75 else "средняя" if score >= 45 else "низкая"
 
 
+def verify_chain(rows):
+    """Проверка хэш-цепочки журнала аудита. rows — записи по возрастанию id."""
+    prev = "GENESIS"
+    for r in rows:
+        expect = sha256_bytes(f"{prev}|{r['ts']}|{r['action']}|{r['detail']}".encode())
+        if r["prev"] != prev or r["hash"] != expect:
+            return False, r["id"]
+        prev = r["hash"]
+    return True, None
+
+
+# ----------------------------------------------------------------- текст, даты, сравнение
+def snapshot_text(data, ctype="text/html"):
+    """Видимый текст снимка построчно (для сравнения версий и мониторинга)."""
+    if not data:
+        return ""
+    s = data.decode("utf-8", "replace")
+    if ctype == "application/json":
+        try:
+            payload = json.loads(s)
+            return json.dumps(payload.get("result", payload), ensure_ascii=False, indent=1, sort_keys=True)
+        except ValueError:
+            return s
+    p = PageParser()
+    try:
+        p.feed(s)
+    except Exception:
+        pass
+    lines = (" ".join(x.split()) for x in p.text)
+    return "\n".join(x for x in lines if x)
+
+
+def diff_lines(la, lb, context=2):
+    """Построчный diff: список {op: eq|add|del|gap, text}. Длинные совпадения сжимаются."""
+    out, added, removed = [], 0, 0
+    sm = difflib.SequenceMatcher(None, la, lb, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            block = la[i1:i2]
+            if len(block) > context * 2 + 1:
+                out += [{"op": "eq", "text": t} for t in block[:context]]
+                out.append({"op": "gap", "text": f"… без изменений: {len(block) - context * 2} строк"})
+                out += [{"op": "eq", "text": t} for t in block[-context:]]
+            else:
+                out += [{"op": "eq", "text": t} for t in block]
+            continue
+        if tag in ("replace", "delete"):
+            out += [{"op": "del", "text": t} for t in la[i1:i2]]
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            out += [{"op": "add", "text": t} for t in lb[j1:j2]]
+            added += j2 - j1
+    return {"lines": out[:4000], "added": added, "removed": removed,
+            "similarity": round(sm.ratio() * 100, 1)}
+
+
+_RE_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?")
+_DATE_KEYS = re.compile(r"date|time|created|updated|expir|valid|registr|first|last|seen|"
+                        r"publish|modified|issued|changed|since|birth", re.I)
+
+
+def parse_date(v):
+    """Строка -> ISO 'YYYY-MM-DD HH:MM' или None. Понимает ISO, wayback (14 цифр),
+    формат сертификатов ('Jan  5 12:00:00 2025 GMT') и 'UTC'-строки Provenio."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    if len(v) > 40:
+        return None
+    m = _RE_ISO.match(v)
+    if m:
+        y, mo, d, hh, mm = m.group(1), m.group(2), m.group(3), m.group(4) or "00", m.group(5) or "00"
+        if 1990 <= int(y) <= 2100 and 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+            return f"{y}-{mo}-{d} {hh}:{mm}"
+        return None
+    if re.fullmatch(r"(19|20)\d{12}", v):
+        return f"{v[:4]}-{v[4:6]}-{v[6:8]} {v[8:10]}:{v[10:12]}"
+    for fmt in ("%b %d %H:%M:%S %Y %Z", "%d-%b-%Y", "%Y.%m.%d", "%d.%m.%Y"):
+        try:
+            return dt.datetime.strptime(" ".join(v.split()), fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    return None
+
+
+def iso_from_store(s):
+    return parse_date(s or "") or (s or "")[:16]
+
+
+def dates_in(data, path="", out=None, limit=200):
+    """Пары (путь_ключа, дата) из вложенного результата инструмента."""
+    out = [] if out is None else out
+    if len(out) >= limit:
+        return out
+    if isinstance(data, dict):
+        for k, v in data.items():
+            p = f"{path}.{k}" if path else str(k)
+            if isinstance(v, str) and _DATE_KEYS.search(str(k)):
+                d = parse_date(v)
+                if d:
+                    out.append((p, d))
+            elif isinstance(v, list) and _DATE_KEYS.search(str(k)) and v and isinstance(v[0], str):
+                for x in v[:5]:
+                    d = parse_date(x)
+                    if d:
+                        out.append((p, d))
+            else:
+                dates_in(v, p, out, limit)
+    elif isinstance(data, list):
+        for i, v in enumerate(data[:100]):
+            dates_in(v, f"{path}[{i}]", out, limit)
+    return out
+
+
+def html_dates(text):
+    """Даты публикации из HTML: article:published_time, <time datetime>, JSON-LD."""
+    out = []
+    for prop, lab in (("article:published_time", "Опубликовано"), ("article:modified_time", "Изменено"),
+                      ("og:updated_time", "Обновлено"), ("datePublished", "Опубликовано"),
+                      ("dateModified", "Изменено")):
+        for m in re.finditer(rf'{re.escape(prop)}["\']?\s*(?:content=|:)\s*["\']([^"\']+)', text):
+            d = parse_date(m.group(1))
+            if d:
+                out.append((lab, d))
+    for m in re.finditer(r'<time[^>]+datetime=["\']([^"\']+)', text, re.I):
+        d = parse_date(m.group(1))
+        if d:
+            out.append(("Дата на странице", d))
+    return out[:30]
+
+
+# ----------------------------------------------------------------- экспорт и пакет доказательств
+def export_case(store, case):
+    srcs = store.sources(case["id"])
+    return {"app": f"{APP_NAME} {APP_VERSION}", "exported": now_iso(), "case": case,
+            "sources": srcs,
+            "entities": [{"type": e["type"], "value": e["value"], "confidence": e["confidence"],
+                          "sources": [s["id"] for s in e["sources"]]}
+                         for e in store.entities(case["id"])],
+            "timeline": store.timeline(case["id"])}
+
+
+def entities_csv(store, case):
+    import csv
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["type", "value", "confidence", "label", "sources"])
+    for e in sorted(store.entities(case["id"]), key=lambda x: -x["confidence"]):
+        w.writerow([e["type"], e["value"], e["confidence"], label(e["confidence"]),
+                    " ".join(str(s["id"]) for s in e["sources"])])
+    return "﻿" + buf.getvalue()   # BOM — чтобы Excel открыл кириллицу
+
+
+EVIDENCE_README = """Пакет доказательств Provenio
+============================
+
+manifest.json   — описание кейса, источники, сущности, ПОЛНЫЙ журнал аудита
+                  и SHA-256 каждого файла пакета.
+snapshots/      — снимки страниц (HTML) и результаты инструментов (JSON).
+report.html     — человекочитаемый отчёт.
+
+Как проверить, что ничего не подменили:
+  1. Откройте Provenio -> Инструменты -> «Проверка пакета доказательств»
+     и выберите этот ZIP. Будут пересчитаны хэши файлов и хэш-цепочка аудита.
+  2. Вручную: SHA-256 каждого файла из snapshots/ должен совпадать с
+     manifest.json -> files, а также с полем sha256 соответствующего источника.
+  3. Зафиксируйте SHA-256 самого manifest.json (показывается при выгрузке) —
+     так подмена манифеста тоже будет заметна.
+"""
+
+
+def build_evidence_zip(store, case):
+    srcs = store.sources(case["id"])
+    files, blobs = {}, {}
+    for s in srcs:
+        data = store.snapshot_bytes(s)
+        if data is not None:
+            path = "snapshots/" + s["snapshot"]
+            blobs[path] = data
+            files[path] = sha256_bytes(data)
+    report = build_report(store, case).encode("utf-8")
+    blobs["report.html"] = report
+    files["report.html"] = sha256_bytes(report)
+    audit = [dict(r) for r in store.db.execute("SELECT * FROM audit ORDER BY id")]
+    manifest = {"format": "provenio-evidence/1", "app": f"{APP_NAME} {APP_VERSION}",
+                "created": now_iso(), "case": case, "sources": srcs,
+                "entities": [{"type": e["type"], "value": e["value"], "confidence": e["confidence"],
+                              "sources": [x["id"] for x in e["sources"]]}
+                             for e in store.entities(case["id"])],
+                "files": files, "audit": audit,
+                "audit_head": audit[-1]["hash"] if audit else "GENESIS"}
+    mbytes = json.dumps(manifest, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", mbytes)
+        z.writestr("README.txt", EVIDENCE_README)
+        for path, data in blobs.items():
+            z.writestr(path, data)
+    store.audit("evidence_exported", f"{case['name']} | manifest sha256={sha256_bytes(mbytes)}")
+    return buf.getvalue(), sha256_bytes(mbytes)
+
+
+def verify_evidence_zip(data):
+    """Проверка пакета: хэши файлов, совпадение с источниками, хэш-цепочка аудита."""
+    z = zipfile.ZipFile(io.BytesIO(data))
+    mbytes = z.read("manifest.json")
+    m = json.loads(mbytes.decode("utf-8"))
+    names = set(z.namelist())
+    bad, missing, ok = [], [], 0
+    for path, h in m.get("files", {}).items():
+        if path not in names:
+            missing.append(path)
+        elif sha256_bytes(z.read(path)) != h:
+            bad.append(path)
+        else:
+            ok += 1
+    src_bad = [s["id"] for s in m.get("sources", [])
+               if s.get("snapshot") and m["files"].get("snapshots/" + s["snapshot"]) not in (None, s["sha256"])]
+    chain_ok, broken = verify_chain(m.get("audit", []))
+    head_ok = (m["audit"][-1]["hash"] if m.get("audit") else "GENESIS") == m.get("audit_head")
+    return {"case": (m.get("case") or {}).get("name"), "created": m.get("created"), "app": m.get("app"),
+            "files_ok": ok, "files_bad": bad, "files_missing": missing, "sources_mismatch": src_bad,
+            "audit_records": len(m.get("audit", [])), "audit_chain_ok": chain_ok and head_ok,
+            "audit_broken_at": broken, "manifest_sha256": sha256_bytes(mbytes),
+            "verdict": "целостность подтверждена" if not (bad or missing or src_bad) and chain_ok and head_ok
+            else "ОБНАРУЖЕНЫ НАРУШЕНИЯ"}
+
+
+# ----------------------------------------------------------------- настройки (ключи API шифруются DPAPI)
+def _dpapi(data, protect):
+    """Шифрование данных ключом текущего пользователя Windows (DPAPI).
+    На других ОС возвращает None — тогда ключи хранятся как есть."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    dst = BLOB()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0x01, ctypes.byref(dst)):
+        return None
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        kernel32.LocalFree(dst.pbData)
+
+
+SECRET_KEYS = ("shodan", "virustotal", "abuseipdb", "urlscan", "otx", "github")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    keys = {}
+    enc = raw.get("keys_dpapi")
+    if enc:
+        import base64
+        plain = _dpapi(base64.b64decode(enc), False)
+        if plain:
+            keys = json.loads(plain.decode("utf-8"))
+    keys.update(raw.get("keys_plain") or {})
+    return {"proxy": raw.get("proxy", ""), "timeout": raw.get("timeout", 15),
+            "keys": {k: keys.get(k, "") for k in SECRET_KEYS}}
+
+
+def save_settings(s):
+    import base64
+    keys = {k: str((s.get("keys") or {}).get(k, "")).strip() for k in SECRET_KEYS}
+    out = {"proxy": str(s.get("proxy", "")).strip(), "timeout": int(s.get("timeout") or 15)}
+    enc = _dpapi(json.dumps(keys).encode("utf-8"), True)
+    if enc:
+        out["keys_dpapi"] = base64.b64encode(enc).decode()
+    else:
+        out["keys_plain"] = keys
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    return load_settings()
+
+
 # ----------------------------------------------------------------- отчёт
 def build_report(store, case):
     srcs, ents = store.sources(case["id"]), store.entities(case["id"])
@@ -331,7 +948,9 @@ def build_report(store, case):
     chain_ok, broken = store.verify_audit()
     e = html.escape
     rows_s = "".join(
-        f"<tr><td>{s['id']}</td><td>{e(s['url'])}<br><small>{e(s['title'])}</small></td>"
+        f"<tr><td>{s['id']}</td><td>{'🛠 ' if s.get('kind') == 'tool' else ''}{e(s['url'])}"
+        f"{' (версия источника #' + str(s['parent_id']) + ')' if s.get('parent_id') else ''}"
+        f"<br><small>{e(s['title'])}</small></td>"
         f"<td>{e(s['fetched'])}</td><td>{e(s['status'])}</td><td>{s['reliability']}/5</td>"
         f"<td><code>{e(s['sha256'])}</code></td><td>{e(s['note'])}</td></tr>" for s in srcs)
     rows_e = "".join(
