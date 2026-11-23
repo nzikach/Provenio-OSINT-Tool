@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Локальные данные кейсов (база и снимки) — не публикуем
+provenio_data/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
