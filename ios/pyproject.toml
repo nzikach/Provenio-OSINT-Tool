@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 author = "nzikach"
 author_email = "360226776+nzikach@users.noreply.github.com"
 
-[tool.briefcase.app.provenio]
+[tool.briefcase.app.provenio_app]
 formal_name = "Provenio"
 description = "OSINT с доказательной базой"
 long_description = """Кейсы и архив источников с SHA-256, 55+ OSINT-инструментов, граф связей,
@@ -25,7 +25,7 @@ requires = [
     "certifi",
 ]
 
-[tool.briefcase.app.provenio.iOS]
+[tool.briefcase.app.provenio_app.iOS]
 requires = [
     "toga-iOS~=0.5.0",
     "std-nslog~=2.0.0",
@@ -33,7 +33,7 @@ requires = [
 splash_background_color = "#060509"
 min_os_version = "15.0"
 
-[tool.briefcase.app.provenio.iOS.info]
+[tool.briefcase.app.provenio_app.iOS.info]
 # экспорт (отчёты, ZIP, CSV) появляется в «Файлы» → На iPhone → Provenio
 UIFileSharingEnabled = true
 LSSupportsOpeningDocumentsInPlace = true
