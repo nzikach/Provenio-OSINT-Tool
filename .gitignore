@@ -17,3 +17,11 @@ provenio_data/
 Thumbs.db
 .vscode/
 .idea/
+
+# iOS: копии ядра и иконки создаются ios/prepare.py при сборке
+ios/src/provenio_app/provenio*.py
+ios/src/provenio_app/provenio_sites.json
+ios/src/provenio_app/assets/
+ios/icons/
+ios/logs/
+ios/dd/

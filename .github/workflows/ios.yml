@@ -1,0 +1,86 @@
+name: Build Provenio.ipa
+
+# Неподписанный IPA для iPhone/iPad (устанавливается через AltStore, SideStore,
+# Sideloadly или TrollStore — они подписывают его вашим Apple ID).
+# Собирается на macOS: BeeWare Briefcase создаёт Xcode-проект, xcodebuild собирает
+# приложение для устройства без подписи, затем .app упаковывается в Payload/ -> .ipa.
+on:
+  push:
+    branches: [main, ios-build]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Prepare sources and icons
+        run: python ios/prepare.py
+
+      - name: Install Briefcase
+        run: python -m pip install "briefcase==0.4.7"
+
+      - name: Create Xcode project
+        working-directory: ios
+        run: |
+          set -o pipefail
+          briefcase create iOS --no-input 2>&1 | tee ../create.log
+
+      - name: Build app for device (unsigned)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          PROJ=$(find build -maxdepth 4 -name "*.xcodeproj" | head -1)
+          echo "Project: $PROJ"
+          xcodebuild -list -project "$PROJ" | tee ../schemes.log
+          SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "import sys,json;print(json.load(sys.stdin)['project']['schemes'][0])")
+          xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ../xcode.log | grep -E "error|warning: .*Python|BUILD" || true
+          test -d "$(find dd/Build/Products -maxdepth 2 -name '*.app' | head -1)"
+
+      - name: Package IPA
+        run: |
+          APP=$(find ios/dd/Build/Products -maxdepth 2 -name "*.app" | head -1)
+          echo "App: $APP"; du -sh "$APP"
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry Provenio.ipa Payload)
+          shasum -a 256 out/Provenio.ipa | awk '{print $1"  Provenio.ipa"}' > out/Provenio.ipa.sha256
+          ls -la out
+
+      - name: Report failure details
+        if: failure()
+        run: |
+          for f in create.log xcode.log; do
+            if [ -f "$f" ]; then
+              msg=$( (grep -nE "error|Error|ERROR|failed|Failed|FAILED|Traceback|exception" "$f" | tail -30; echo ----; tail -25 "$f") \
+                | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+              echo "::error title=$f::$msg"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Provenio-ipa
+          path: |
+            out/Provenio.ipa
+            out/Provenio.ipa.sha256
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/Provenio.ipa
+            out/Provenio.ipa.sha256

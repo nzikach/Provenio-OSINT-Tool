@@ -34,6 +34,8 @@ JOBS = {}
 BLOBS = {}
 UPDATE = {"ts": 0, "data": None}
 MAX_BODY = 45 * 1024 * 1024   # загрузка файлов для анализа метаданных / проверки пакета
+PLATFORM = os.environ.get("PROVENIO_PLATFORM", "desktop")   # "ios" — приложение для iPhone
+EXPORT_DIR = os.environ.get("PROVENIO_EXPORT_DIR", "")       # куда сохранять экспорт на iPhone («Файлы»)
 
 
 def capture_fn():
@@ -409,6 +411,20 @@ def api(path, q, body):
         return {"id": bid}
     if path == "portable":
         return make_portable()
+    if path == "open_url":
+        url = str(body.get("url", ""))
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("Открываются только веб-ссылки")
+        webbrowser.open(url)
+        return {}
+    if path == "export_save":
+        data, ctype, fname = download(str(body.get("kind")), str(body.get("case")))
+        folder = EXPORT_DIR or os.path.join(P.DATA_DIR, "exports")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, fname), "wb") as f:
+            f.write(data)
+        S.audit("export_saved", fname)
+        return {"name": fname, "folder": folder}
     if path == "rel":
         S.update_source(int(body["id"]), reliability=max(1, min(5, int(body["reliability"]))))
         return {}
@@ -564,8 +580,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/":
                 if not self.host_ok():
                     return self.out(403, "forbidden", "text/plain")
-                return self.out(200, PAGE.replace("__TOKEN__", TOKEN).replace("__VER__", P.APP_VERSION),
-                                "text/html; charset=utf-8")
+                return self.out(200, PAGE.replace("__TOKEN__", TOKEN).replace("__VER__", P.APP_VERSION)
+                                .replace("__PLAT__", PLATFORM), "text/html; charset=utf-8")
             if not self.authorized(q):
                 return self.out(403, {"error": "forbidden"})
             if u.path == "/api/tool":   # совместимость с 1.x: синхронный вызов
@@ -685,7 +701,7 @@ def main():
 
 
 PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Provenio</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Provenio</title>
 <style>
 :root{
  --bg:#060509; --bg2:#0a0713; --panel:rgba(20,14,34,.55);
@@ -968,6 +984,41 @@ table.t th{color:var(--ac2);font-weight:600}
 .pb:hover{transform:translateY(-2px);border-color:var(--bd2)}.pb.on{border-color:var(--ac);background:rgba(139,92,246,.2)}
 .pb b{display:block}.pb small{color:var(--mu);font-size:11px}
 .ent{cursor:pointer}
+#cv,#gcv{touch-action:none}
+@media(max-width:820px){
+ body{display:block;height:auto;min-height:100vh;overflow:auto;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+ aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px;border-right:0;border-bottom:1px solid var(--bd);
+  position:relative;min-height:auto}
+ aside::after,aside>.cap,aside>.hint{display:none}
+ .logo{font-size:16px;gap:9px}.logo b{width:28px;height:28px;font-size:14px;border-radius:9px}
+ .newc{flex:1;min-width:140px}.newc input{padding:8px 10px}.newc .btn{padding:8px 13px}
+ .cases{flex-direction:row;overflow-x:auto;flex:1 1 100%;margin:0;padding:1px 0;gap:6px}
+ .case{white-space:nowrap;padding:7px 12px;animation:none;flex-shrink:0}.case:hover{transform:none}
+ .side-foot{flex-direction:row;overflow-x:auto;flex:1 1 100%;gap:6px}
+ .side-foot .ghost{padding:7px 10px;font-size:11.5px;flex-shrink:0}.side-foot .ver{display:none}
+ main{height:auto;display:block}
+ header{flex-wrap:wrap;padding:12px;gap:7px}
+ header #url{flex:1 1 100%;order:-1}
+ header .btn,header .ghost{padding:8px 11px;font-size:12px}header .pill{font-size:11px;padding:6px 10px}
+ .stats{grid-template-columns:repeat(2,1fr);gap:9px;padding:4px 12px}
+ .stat b{font-size:24px}.card{padding:13px;border-radius:15px}
+ .tabs{overflow-x:auto;padding:4px 12px 0;margin:4px 0 12px;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}
+ .tab{white-space:nowrap;padding:10px 12px;flex-shrink:0}#ink{display:none}.tab.on{box-shadow:inset 0 -2px 0 var(--ac)}
+ .panels{overflow:visible;padding:0 12px 28px}
+ .tgrid,.rgrid,.lgrid,.pbs{grid-template-columns:1fr}
+ .tool .tin{flex-wrap:wrap}.tool .tin input,.tool .tin textarea{flex:1 1 100%}
+ .ent{grid-template-columns:10px 58px minmax(0,1fr) 42px;gap:8px;padding:10px 8px}.ent .bar,.ent>span:last-child{display:none}
+ #p-graph,#p-globe{height:70vh;min-height:360px}
+ .ghud{width:auto;left:8px;right:8px;top:8px;max-height:46%;padding:10px 12px;gap:6px}
+ .ghud.min>:not(.gtitle){display:none}
+ .ginfo{width:auto;left:8px;right:8px;top:auto;bottom:8px;max-height:55%}
+ .gcred{display:none}.gcoord{bottom:auto;top:8px;right:14px}
+ .modal{width:96vw;max-height:88vh;padding:16px}.frow{grid-template-columns:1fr;gap:4px}
+ .menu{max-width:92vw}
+ #toasts{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom))}.toast{max-width:none}
+ table.t{display:block;overflow-x:auto}
+ .lhead .big{font-size:32px}
+}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(168,130,255,.2);border-radius:9px}
@@ -1077,7 +1128,7 @@ table.t th{color:var(--ac2);font-weight:600}
 </main>
 <div id="toasts"></div>
 <script>
-const T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const PLAT="__PLAT__",IOS=PLAT==="ios",T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const TY={email:"#fb923c",phone:"#34d399",domain:"#60a5fa",ip:"#c084fc",account:"#f87171",src:"#e5e7eb"};
 const TL={email:"Email",phone:"Телефон",domain:"Домен",ip:"IP",account:"Аккаунт"};
@@ -1172,14 +1223,14 @@ function buildGraph(){if(!st)return;const old=new Map(G.nodes.map(n=>[n.id,n])),
  const E=st.entities.length>250?st.entities.filter(e=>e.src.length>1||e.src.some(i=>recent.has(i))).slice(0,400):st.entities;
  E.forEach(e=>{nodes.push(mk("e"+e.id,e.type,e.value));e.src.forEach(i=>{const a=idx.get("s"+i);if(a)edges.push([a,idx.get("e"+e.id)])})});
  G.nodes=nodes;G.edges=edges}
-function nearest(x,y){let b=null,bd=1e9;for(const n of G.nodes){const d=Math.hypot(n.x-x,n.y-y);if(d<15&&d<bd){b=n;bd=d}}return b}
+function nearest(x,y){let b=null,bd=1e9;const lim=matchMedia("(pointer:coarse)").matches?26:15;for(const n of G.nodes){const d=Math.hypot(n.x-x,n.y-y);if(d<lim&&d<bd){b=n;bd=d}}return b}
 const pt=e=>{const r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]};
 let downAt=null;
-cv.onmousedown=e=>{const[x,y]=pt(e);downAt=[e.clientX,e.clientY];G.drag=nearest(x,y);if(G.drag)cv.style.cursor="grabbing"};
-window.addEventListener("mouseup",e=>{const n=G.drag;G.drag=null;cv.style.cursor="grab";
+cv.onpointerdown=e=>{const[x,y]=pt(e);downAt=[e.clientX,e.clientY];G.drag=nearest(x,y);if(G.drag)cv.style.cursor="grabbing"};
+window.addEventListener("pointerup",e=>{const n=G.drag;G.drag=null;cv.style.cursor="grab";
  if(n&&downAt&&Math.hypot(e.clientX-downAt[0],e.clientY-downAt[1])<5)pivotMenu(n,e.clientX,e.clientY);downAt=null});
-cv.onmousemove=e=>{const[x,y]=pt(e);if(G.drag){G.drag.x=x;G.drag.y=y;G.drag.vx=G.drag.vy=0}G.hover=nearest(x,y)};
-cv.onmouseleave=()=>G.hover=null;
+cv.onpointermove=e=>{const[x,y]=pt(e);if(G.drag){G.drag.x=x;G.drag.y=y;G.drag.vx=G.drag.vy=0}G.hover=nearest(x,y)};
+cv.onpointerleave=()=>G.hover=null;
 function tick(){requestAnimationFrame(tick);if(tab!=="graph"||!W)return;const N=G.nodes;
  for(let i=0;i<N.length;i++){const a=N[i];a.age=Math.min(1,a.age+.04);
   for(let j=i+1;j<N.length;j++){const b=N[j];let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.5,m=Math.sqrt(d2),f=2800/d2;dx/=m;dy/=m;a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f}
@@ -1620,7 +1671,15 @@ async function addUrls(){const list=$("#url").value.split(/[\s,]+/).filter(Boole
 $("#add").onclick=addUrls;$("#url").onkeydown=e=>{if(e.key==="Enter")addUrls()};
 $("#ver").onclick=async()=>{if(!cur)return;await refresh();const i=st.integrity;
  toast("Снимки: "+i.snap_ok+" целы, "+i.snap_bad+" нарушены. Журнал: "+(i.chain?"цел":"НАРУШЕН"),i.snap_bad||!i.chain?"bad":"ok")};
-function dl(kind){if(!cur)return;const a=document.createElement("a");a.href=`/download/${kind}?case=${cur.id}&t=${T}`;
+function viewer(u,title){modal(esc(title||"Просмотр"),`<iframe src="${esc(u)}" style="width:100%;height:72vh;border:0;border-radius:12px;background:#fff"></iframe>`)}
+function saveIOS(kind,id){return api("export_save",{kind,case:id}).then(r=>toast("Сохранено: «Файлы» → На iPhone → Provenio → "+r.name,"ok")).catch(x=>toast(x.message,"bad"))}
+if(IOS){
+ document.addEventListener("click",e=>{const a=e.target.closest("a[target=_blank]");if(!a)return;e.preventDefault();e.stopPropagation();
+  const h=a.getAttribute("href")||"";if(/^https?:/i.test(h))api("open_url",{url:h}).catch(x=>toast(x.message,"bad"));else viewer(h)},true);
+ window.open=u=>{if(/^https?:/i.test(u))api("open_url",{url:u});else viewer(u);return null};
+}
+function dl(kind){if(!cur)return;
+ if(IOS){if(kind==="report")viewer(`/download/report?case=${cur.id}&t=${T}`,"Отчёт");else saveIOS(kind,cur.id);setTimeout(refresh,800);return}const a=document.createElement("a");a.href=`/download/${kind}?case=${cur.id}&t=${T}`;
  if(kind==="report")a.target="_blank";else a.download="";document.body.append(a);a.click();a.remove();setTimeout(refresh,800)}
 $("#rep").onclick=e=>{e.stopPropagation();if(!cur)return toast("Сначала выберите кейс","bad");const r=e.target.getBoundingClientRect();
  showMenu(r.left,r.bottom+6,[["Экспорт кейса",null],["📄 Отчёт HTML (откроется в браузере)",()=>dl("report")],["🧾 Пакет доказательств ZIP",()=>dl("evidence")],
@@ -1642,13 +1701,13 @@ async function openSettings(){const s=await api("settings"),i=await api("info");
   <div class="sec" style="margin-top:14px"><b>Архивация страниц</b>
    ${chk("scap",s.capture_screenshot,"Сохранять скриншот страницы (PNG) как доказательство")}
    ${chk("spdf",s.capture_pdf,"Сохранять страницу в PDF")}
-   <div class="hint">${i.browser?"Браузер для снимков: "+esc(i.browser):"⚠ Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
+   <div class="hint">${IOS?"На iPhone скриншоты и PDF страниц пока недоступны — сохраняются HTML-снимок и SHA-256.":i.browser?"Браузер для снимков: "+esc(i.browser):"⚠ Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
   <div class="sec"><b>Метка времени RFC 3161 для пакета доказательств</b>
    ${chk("stsa",s.tsa_enabled,"Заверять manifest.json у независимой службы времени (TSA)")}
    <div class="frow"><label>Служба TSA</label><input id="stsau" placeholder="http://timestamp.digicert.com (по умолчанию)" value="${esc(s.tsa_url||"")}"></div></div>
   <div class="sec"><b>Прочее</b>${chk("supd",s.check_updates,"Проверять обновления на GitHub при запуске")}</div>
   <div class="sec"><b>Портативный режим</b><div class="hint">${i.portable?"✓ Включён: данные хранятся в папке ProvenioData рядом с программой.":"Данные в профиле пользователя: "+esc(i.data_dir)}</div>
-   ${i.portable?"":`<button class="ghost" id="sport" style="margin-top:6px">💾 Перенести данные к программе (флешка)</button>`}</div>
+   ${i.portable||IOS?"":`<button class="ghost" id="sport" style="margin-top:6px">💾 Перенести данные к программе (флешка)</button>`}</div>
   <div class="row" style="margin-top:14px"><button class="btn" id="ssave">Сохранить</button><span class="pmsg">Provenio ${esc(i.version)} · инструментов: ${i.tools} · сайтов для поиска по нику: ${i.sites}<br>Данные: ${esc(i.data_dir)}</span></div>`);
  b.querySelector("#ssave").onclick=async()=>{const keys={};b.querySelectorAll(".skey").forEach(x=>keys[x.dataset.k]=x.value);
   const g=id=>b.querySelector(id);
@@ -1760,6 +1819,7 @@ async function exportPng(){if(tab!=="graph"){setTab("graph");await new Promise(r
  x.fillStyle="#08060f";x.fillRect(0,0,c.width,c.height);x.drawImage(cv,0,0);
  x.fillStyle="#9b93b5";x.font=(12*dpr)+"px Segoe UI";x.fillText(`Provenio · ${cur?cur.name:""} · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC`,14*dpr,22*dpr);
  const r=await api("blob",{data:c.toDataURL("image/png"),ctype:"image/png",name:`provenio_graph_${(cur&&cur.name||"case").replace(/[^\w-]+/g,"_")}.png`});
+ if(IOS)return saveIOS("blob",r.id);
  const a=document.createElement("a");a.href=`/download/blob?id=${r.id}&t=${T}`;a.download="";document.body.append(a);a.click();a.remove()}
 
 /* =================== IP-РАДАР =================== */
@@ -1890,19 +1950,23 @@ async function globeOpen(){gSize();if(GV.inited)return;GV.inited=true;
  setInterval(()=>{if(tab==="globe"&&GV.L.flights.on)gLoad("flights")},30000);requestAnimationFrame(gTick)}
 $$("#p-globe [data-l]").forEach(c=>c.onchange=()=>{const L=GV.L[c.dataset.l];L.on=c.checked;if(L.on&&!L.items.length)gLoad(c.dataset.l)});
 $("#ggroup").onchange=e=>{GV.L.sats.group=e.target.value;GV.L.sats.items=[];gLoad("sats")};
-$("#gauto").onchange=e=>GV.auto=e.target.checked;$("#gnight").onchange=e=>GV.night=e.target.checked;
+$("#gauto").onchange=e=>GV.auto=e.target.checked;
+$(".gtitle").onclick=()=>$(".ghud").classList.toggle("min");if(innerWidth<820)$(".ghud").classList.add("min");$("#gnight").onchange=e=>GV.night=e.target.checked;
 $("#gq").onkeydown=async e=>{if(e.key!=="Enter")return;try{const r=await api("globe?layer=geocode&q="+encodeURIComponent(e.target.value));
  $("#gres").innerHTML=r.map((x,i)=>`<div data-i="${i}">${esc(x.name)}</div>`).join("")||'<div>Ничего не найдено</div>';
  $("#gres").onclick=ev=>{const d=ev.target.closest("[data-i]");if(d){const x=r[+d.dataset.i];globeGo(x.lon,x.lat,x.name.split(",")[0]);$("#gres").innerHTML=""}}}catch(x){toast(x.message,"bad")}};
 function globeGo(lon,lat,label){setTab("globe");GV.auto=false;$("#gauto").checked=false;GV.fly={lon,lat};GV.mark={lon,lat,label};GV.zoom=Math.max(GV.zoom,2.2)}
 async function globeFindIp(ip){const L=GV.L.cas;if(!L.items.length)await gLoad("cas");const p=L.items.find(x=>x.label===ip);if(p){globeGo(p.lon,p.lat,ip);gSelect("cas",p)}else toast("Нет координат для "+ip,"bad")}
-let gDown=null;
-gc.onmousedown=e=>{gDown={x:e.clientX,y:e.clientY,lon:GV.lon,lat:GV.lat,moved:false};gc.style.cursor="grabbing"};
-window.addEventListener("mousemove",e=>{const r=gc.getBoundingClientRect();if(tab==="globe"){const u=unproj(e.clientX-r.left,e.clientY-r.top);$("#gcoord").textContent=u?`${u.lat.toFixed(3)}°, ${u.lon.toFixed(3)}°`:""}
+let gDown=null;const GP=new Map();let pinch0=null;
+gc.onpointerdown=e=>{GP.set(e.pointerId,[e.clientX,e.clientY]);
+ if(GP.size===2){const[a,b]=[...GP.values()];pinch0={d:Math.hypot(a[0]-b[0],a[1]-b[1])||1,z:GV.zoom};gDown=null;return}
+ gDown={x:e.clientX,y:e.clientY,lon:GV.lon,lat:GV.lat,moved:false,touch:e.pointerType==="touch"};gc.style.cursor="grabbing"};
+window.addEventListener("pointermove",e=>{if(GP.has(e.pointerId))GP.set(e.pointerId,[e.clientX,e.clientY]);
+ if(pinch0&&GP.size===2){const[a,b]=[...GP.values()];GV.zoom=Math.max(.6,Math.min(30,pinch0.z*Math.hypot(a[0]-b[0],a[1]-b[1])/pinch0.d));return}const r=gc.getBoundingClientRect();if(tab==="globe"){const u=unproj(e.clientX-r.left,e.clientY-r.top);$("#gcoord").textContent=u?`${u.lat.toFixed(3)}°, ${u.lon.toFixed(3)}°`:""}
  if(!gDown)return;const dx=e.clientX-gDown.x,dy=e.clientY-gDown.y;if(Math.abs(dx)+Math.abs(dy)>3)gDown.moved=true;
  const k=90/gR();GV.lon=gDown.lon-dx*k;GV.lat=Math.max(-85,Math.min(85,gDown.lat+dy*k));GV.fly=null;GV.track=false});
-window.addEventListener("mouseup",e=>{if(!gDown)return;const m=gDown.moved;gDown=null;gc.style.cursor="grab";if(m)return;
- const r=gc.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;let best=null,bd=10;
+window.addEventListener("pointerup",e=>{GP.delete(e.pointerId);if(GP.size<2)pinch0=null;if(!gDown)return;const m=gDown.moved,tch=gDown.touch;gDown=null;gc.style.cursor="grab";if(m)return;
+ const r=gc.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;let best=null,bd=tch?24:10;
  for(const h of GV.hits){const d=Math.hypot(h.x-x,h.y-y);if(d<bd){bd=d;best=h}}if(best)gSelect(best.l,best.o);else{GV.sel=null;$("#ginfo").classList.remove("show")}});
 gc.addEventListener("wheel",e=>{e.preventDefault();GV.zoom=Math.max(.6,Math.min(30,GV.zoom*(e.deltaY<0?1.15:1/1.15)))},{passive:false});
 function gSelect(l,o){GV.sel={l,o};GV.track=false;const el=$("#ginfo");el.classList.add("show");const now=Date.now();let h="";
