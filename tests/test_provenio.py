@@ -17,6 +17,7 @@ os.environ["PROVENIO_DATA"] = tempfile.mkdtemp(prefix="provenio_test_")
 import provenio as P            # noqa: E402
 import provenio_tools as T      # noqa: E402
 import provenio_osint as O      # noqa: E402
+import provenio_plus as X       # noqa: E402
 
 
 def new_store():
@@ -190,6 +191,84 @@ class ToolTests(unittest.TestCase):
             self.assertIn(name, T.TOOLS)
 
 
+class PlusTests(unittest.TestCase):
+    def test_keccak512_vector(self):
+        # оригинальный Keccak-512 отличается от SHA3-512 дополнением
+        self.assertTrue(X.keccak512(b"").startswith("0eab42de4c3ceb9235fc91acffe746b2"))
+        self.assertNotEqual(X.keccak512(b"abc"), __import__("hashlib").sha3_512(b"abc").hexdigest())
+
+    def test_rfc3161_request_and_parse(self):
+        import hashlib
+        d = hashlib.sha256(b"manifest").digest()
+        req = P.rfc3161_request(d, 12345)
+        self.assertEqual(req[0], 0x30)
+        self.assertIn(d, req)
+        tst = P._der(0x30, P._der_int(1) + P._der(0x06, b"\x2a\x03") +
+                     P._der(0x30, P._der(0x30, P.SHA256_OID + b"\x05\x00") + P._der(0x04, d)) +
+                     P._der_int(777) + P._der(0x18, b"20261124101112Z"))
+        token = P._der(0x30, P._der(0x06, b"\x2a\x03") + P._der(0xA0, P._der(0x04, tst)))
+        info = P.rfc3161_parse_token(token)
+        self.assertEqual(info["imprint"], d.hex())
+        self.assertEqual(info["gen_time"], "2026-11-24 10:11:12 UTC")
+
+    def test_intersections_dossier_attachments(self):
+        s = new_store()
+        a, b = s.add_case("A"), s.add_case("B")
+        sa, _ = s.add_tool_result(a, "x", "q", {"m": "shared@corp.com", "ip": "93.184.216.34"})
+        s.add_tool_result(b, "x", "q", {"m": "shared@corp.com"})
+        inter = s.intersections(a)
+        self.assertEqual([x["value"] for x in inter], ["shared@corp.com"])
+        eid = next(e["id"] for e in s.entities(a) if e["value"] == "shared@corp.com")
+        d = s.dossier(a, eid)
+        self.assertEqual(d["other_cases"][0]["name"], "B")
+        self.assertTrue(any(r["value"] == "93.184.216.34" for r in d["related"]))
+        self.assertTrue(d["context"])
+        s.add_attachment(sa, "screenshot", b"\x89PNG fake", "png")
+        self.assertEqual(s.verify_snapshots(a)[1], [])
+        data, _ = P.build_evidence_zip(s, s.case(a))
+        names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+        self.assertTrue(any(n.endswith(".png") for n in names))
+        self.assertEqual(P.verify_evidence_zip(data)["verdict"], "целостность подтверждена")
+
+    def test_graph_exports(self):
+        import xml.dom.minidom
+        s = new_store()
+        cid = s.add_case("g")
+        s.add_tool_result(cid, "x", "q", {"m": "a@b.com"})
+        c = s.case(cid)
+        xml.dom.minidom.parseString(X.graph_gexf(s, c))
+        xml.dom.minidom.parseString(X.graph_graphml(s, c))
+        self.assertIn("maltego.EmailAddress", X.graph_edges_csv(s, c).decode("utf-8-sig"))
+
+    def test_import_sherlock_spiderfoot(self):
+        r = X.import_file({"q": "https://github.com/jd\nhttps://www.reddit.com/user/jd\n"
+                                "Total Websites Username Detected On : 2", "filename": "jd.txt"})
+        self.assertEqual((r["format"], r["count"]), ("Sherlock TXT", 2))
+        sf = "Scan Name,Updated,Type,Module,Source,F/P,Data\nx,1,EMAILADDR,sfp,s,0,admin@ex.com\n"
+        r = X.import_file({"file": base64.b64encode(sf.encode()).decode(), "filename": "sf.csv"})
+        self.assertEqual(r["format"], "SpiderFoot")
+        self.assertIn(("email", "admin@ex.com"), P.extract_entities_data(r))
+
+    def test_feed_parsing(self):
+        ips, nets = X._parse_feed("ip", b"# c\n1.2.3.4\n5.6.7.8 ; note\n")
+        self.assertEqual(len(ips), 2)
+        ips, nets = X._parse_feed("cidr", b"10.0.0.0/8 ; SBL1\n")
+        import ipaddress
+        self.assertTrue(X._in_feed(int(ipaddress.ip_address("10.1.2.3")), (ips, nets)))
+        ips, nets = X._parse_feed("json:prefixes.ip_prefix", b'{"prefixes":[{"ip_prefix":"3.0.0.0/15"}]}')
+        self.assertEqual(len(nets), 1)
+
+    def test_phishing_helpers(self):
+        self.assertEqual(X._lev("paypa1", "paypal"), 1)
+        self.assertEqual(X._reg_domain("login.secure.example.co.uk"), "example.co.uk")
+        self.assertEqual(len(X.playbook_steps("email", "a@b.com")), 6)
+        self.assertEqual(X.playbook_steps("email", "a@b.com")[3], ("whois", "b.com"))
+
+    def test_new_tools_registered(self):
+        for t in ("phishing", "ip_radar", "leaks", "capture", "import_file", "tsa"):
+            self.assertIn(t, T.TOOLS)
+
+
 class UITests(unittest.TestCase):
     def test_page_and_api(self):
         import threading
@@ -224,6 +303,14 @@ class UITests(unittest.TestCase):
             self.assertGreaterEqual(saved["entities"], 2)
             state = call("state?case=" + str(cid))
             self.assertEqual(state["sources"][0]["kind"], "tool")
+            self.assertIn("att", state["sources"][0])
+            self.assertEqual(len(call("playbooks")), len(X.PLAYBOOKS))
+            self.assertIsInstance(call("intersections"), list)
+            for tab in ("p-globe", "p-radar", "p-leaks"):
+                self.assertIn(tab, page)
+            world = direct.open(urllib.request.Request(base + "/static/world.json",
+                                                       headers={"X-Token": U.TOKEN})).read()
+            self.assertIn(b"Topology", world)
         finally:
             srv.shutdown()
 

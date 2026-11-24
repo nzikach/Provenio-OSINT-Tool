@@ -24,13 +24,25 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import provenio as P
 import provenio_tools as TL
 import provenio_osint  # noqa: F401  (регистрирует новые инструменты в TL.TOOLS)
+import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, глобус, сценарии, ИИ-сводка
 
 S = P.Store()
 LOCK = S.lock
 TOKEN = secrets.token_urlsafe(24)
 TL.configure(P.load_settings())
 JOBS = {}
+BLOBS = {}
+UPDATE = {"ts": 0, "data": None}
 MAX_BODY = 45 * 1024 * 1024   # загрузка файлов для анализа метаданных / проверки пакета
+
+
+def capture_fn():
+    """Функция снимка экрана/PDF по настройкам (или None, если выключено)."""
+    st = P.load_settings()
+    shot, pdf = bool(st.get("capture_screenshot")), bool(st.get("capture_pdf"))
+    if not (shot or pdf) or not X.find_browser():
+        return None
+    return lambda url: X.capture_page(url, screenshot=shot, pdf=pdf)
 
 
 def case_by_id(cid):
@@ -48,7 +60,10 @@ def state(cid):
             if s.get("parent_id"):
                 children[s["parent_id"]] = children.get(s["parent_id"], 0) + 1
         keys = ("id", "url", "title", "fetched", "status", "size", "sha256", "snapshot", "reliability",
-                "note", "kind", "tool", "query", "parent_id")
+                "note", "kind", "tool", "query", "parent_id", "found_on")
+        atts = S.attachments(cid)
+        inter = {(x["type"], x["value"]): [c["name"] for c in x["cases"] if c["id"] != cid]
+                 for x in S.intersections(cid)}
         audit = [dict(r) for r in S.db.execute(
             "SELECT id,ts,action,detail,hash FROM audit ORDER BY id DESC LIMIT 300")]
     out_src = []
@@ -57,11 +72,14 @@ def state(cid):
         m = mons.get(s["id"])
         d["monitor"] = {"interval": m["interval_min"], "last": m["last_check"], "changes": m["changes"]} if m else None
         d["versions"] = children.get(s["id"], 0)
+        d["att"] = [{"kind": a["kind"], "file": a["file"], "sha256": a["sha256"], "size": a["size"]}
+                    for a in atts.get(s["id"], [])]
         out_src.append(d)
     return {
         "sources": out_src,
         "entities": [{"id": e["id"], "type": e["type"], "value": e["value"],
-                      "conf": e["confidence"], "src": [s["id"] for s in e["sources"]]} for e in ents],
+                      "conf": e["confidence"], "src": [s["id"] for s in e["sources"]],
+                      "other": inter.get((e["type"], e["value"]), [])} for e in ents],
         "audit": audit,
         "integrity": {"snap_ok": ok, "snap_bad": len(bad), "chain": chain},
     }
@@ -97,9 +115,143 @@ def start_job(body):
     return {"id": jid}
 
 
+def start_custom(name, q, fn, saveable=True):
+    """Фоновая задача из произвольной функции fn(job) -> результат."""
+    jid = uuid.uuid4().hex[:12]
+    job = TL.Job()
+    rec = {"id": jid, "name": name, "q": str(q)[:200], "job": job, "state": "running", "result": None,
+           "error": None, "started": time.time(), "saved": None, "saveable": saveable}
+    JOBS[jid] = rec
+
+    def work():
+        try:
+            rec["result"] = fn(job)
+            rec["state"] = "done"
+        except TL.Cancelled:
+            rec["state"] = "cancelled"
+        except Exception as e:
+            traceback.print_exc()
+            rec["state"] = "error"
+            rec["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+    threading.Thread(target=work, daemon=True).start()
+    return {"id": jid}
+
+
+def run_playbook(case_id, pid, q, job):
+    steps = X.playbook_steps(pid, q)
+    pb = X.PLAYBOOKS[pid]
+    job.total(len(steps) + (1 if pb.get("archive") else 0))
+    out = []
+    if pb.get("archive"):
+        job.note("Архивирование страницы…")
+        sid, st = S.add_source(case_id, q if "://" in q else "https://" + q, capture=capture_fn())
+        out.append({"tool": "archive", "q": q, "state": "done" if st.startswith("OK") else "error",
+                    "source": sid, "error": None if st.startswith("OK") else st})
+        job.step()
+
+    def one(step):
+        tool, val = step
+        job.check()
+        sub = TL.Job()
+        sub.cancelled = job.cancelled
+        try:
+            res = TL.run_tool(tool, {"q": val}, sub)
+            sid, n = S.add_tool_result(case_id, tool, val, res)
+            return {"tool": tool, "q": val, "state": "done", "source": sid, "entities": n}
+        except TL.Cancelled:
+            raise
+        except Exception as e:
+            return {"tool": tool, "q": val, "state": "error", "error": f"{type(e).__name__}: {str(e)[:160]}"}
+    job.note(f"Сценарий «{pb['title']}»: {len(steps)} инструментов…")
+    for it, r, err in TL.pmap(one, steps, job, workers=3):
+        out.append(r or {"tool": it[0], "q": it[1], "state": "error", "error": err})
+    S.audit("playbook_run", f"{pb['title']} | {q} | шагов {len(out)}")
+    return {"playbook": pb["title"], "query": q, "steps": out,
+            "ok": sum(1 for x in out if x["state"] == "done"), "failed": sum(1 for x in out if x["state"] != "done")}
+
+
+def run_expand(case_id, sid, depth, limit, same_host, job):
+    """Обход ссылок источника на глубину N: каждая страница архивируется как отдельный источник."""
+    src = S.source(sid)
+    if not src or src.get("kind") != "web":
+        raise ValueError("Обход возможен только для веб-источника")
+    have = {s["url"] for s in S.sources(case_id)} | {s["final_url"] for s in S.sources(case_id)}
+    root_host = P.host_of(src["final_url"] or src["url"])
+    frontier, added, failed = [(sid, 0)], [], 0
+    job.total(limit)
+    while frontier and len(added) < limit:
+        cur, d = frontier.pop(0)
+        if d >= depth:
+            continue
+        for u in S.page_links(cur):
+            if len(added) >= limit:
+                break
+            job.check()
+            if u in have or X.O._SKIP_EXT.search(u):
+                continue
+            if same_host and P.host_of(u) != root_host:
+                continue
+            have.add(u)
+            job.note(f"Архивирование {u[:80]}")
+            nid, st = S.add_source(case_id, u, found_on=cur)
+            added.append({"id": nid, "url": u, "status": st, "depth": d + 1})
+            if st.startswith("OK"):
+                frontier.append((nid, d + 1))
+            else:
+                failed += 1
+            job.step()
+    S.audit("links_expanded", f"id={sid} depth={depth} added={len(added)}")
+    return {"root": sid, "added": len(added), "failed": failed, "pages": added}
+
+
+def case_geo(cid):
+    """Точки кейса для глобуса: IP-адреса (геолокация) и GPS из метаданных фото."""
+    ents = S.entities(cid)
+    ips = [e for e in ents if e["type"] == "ip"]
+    geo = X.geolocate_ips([e["value"] for e in ips])
+    pts = []
+    for e in ips:
+        g = geo.get(e["value"]) or {}
+        if g.get("lat") is not None:
+            pts.append({"kind": "ip", "label": e["value"], "lat": g["lat"], "lon": g["lon"], "entity": e["id"],
+                        "conf": e["confidence"], "info": f"{g.get('city') or ''}, {g.get('country') or ''} · "
+                                                         f"{g.get('isp') or ''}"})
+    for s in S.sources(cid):
+        if s.get("tool") != "file_meta":
+            continue
+        try:
+            res = json.loads((S.snapshot_bytes(s) or b"{}").decode("utf-8")).get("result") or {}
+        except ValueError:
+            continue
+        g = res.get("gps")
+        if g and g.get("lat") is not None:
+            pts.append({"kind": "photo", "label": res.get("name") or s.get("query"), "lat": g["lat"],
+                        "lon": g["lon"], "source": s["id"], "info": "GPS из метаданных файла"})
+    return {"items": pts, "ips_total": len(ips)}
+
+
+def brand_loop_once():
+    for m in S.due_brand_monitors():
+        try:
+            base = json.loads(m["baseline"] or "{}")
+            snap = X.brand_snapshot(m["domain"])
+            d = X.brand_diff(base, snap)
+            changed = bool(d["new_lookalikes"] or d["new_subdomains"])
+            if changed:
+                S.add_tool_result(m["case_id"], "brand_monitor", m["domain"], {**d, "domain": m["domain"]})
+                S.notify(m["case_id"], f"Бренд {m['domain']}: новых двойников {len(d['new_lookalikes'])}, "
+                                       f"новых поддоменов {len(d['new_subdomains'])}")
+            S.update_brand_monitor(m["id"], snap, changed)
+        except Exception:
+            traceback.print_exc()
+            S.update_brand_monitor(m["id"], json.loads(m["baseline"] or "{}"), False)
+
+
 def save_job(rec, case_id, pivot=None):
     if rec["state"] != "done":
         raise ValueError("Задача ещё не завершена")
+    if rec.get("saveable") is False:
+        raise ValueError("Результаты этой задачи уже сохранены в кейс")
     q = rec["q"] if rec["name"] not in ("file_meta", "evidence_verify") else \
         (rec["result"] or {}).get("name") or rec["q"] or "файл"
     sid, n = S.add_tool_result(case_id, rec["name"], q, rec["result"],
@@ -122,20 +274,27 @@ def job_status(jid):
 
 # ----------------------------------------------------------------- мониторинг страниц
 def monitor_loop():
+    last_brand = 0
     while True:
         time.sleep(30)
         try:
             for sid in S.due_monitors():
-                S.check_monitor(sid)
+                S.check_monitor(sid, capture=capture_fn())
         except Exception:
             traceback.print_exc()
+        if time.time() - last_brand > 120:
+            last_brand = time.time()
+            threading.Thread(target=brand_loop_once, daemon=True).start()
 
 
 # ----------------------------------------------------------------- настройки
 def settings_public():
     s = P.load_settings()
     keys = {k: (("•" * 6 + v[-4:]) if v else "") for k, v in s["keys"].items()}
-    return {"proxy": s["proxy"], "timeout": s["timeout"], "keys": keys}
+    out = {"proxy": s["proxy"], "timeout": s["timeout"], "keys": keys}
+    for k in P.OPTIONS:
+        out[k] = s.get(k)
+    return out
 
 
 def settings_save(body):
@@ -145,8 +304,11 @@ def settings_save(body):
         if v is None or (isinstance(v, str) and v.startswith("•")):
             continue   # поле не меняли
         new_keys[k] = str(v).strip()
-    s = P.save_settings({"proxy": body.get("proxy", cur["proxy"]), "timeout": body.get("timeout", cur["timeout"]),
-                         "keys": new_keys})
+    new = {"proxy": body.get("proxy", cur["proxy"]), "timeout": body.get("timeout", cur["timeout"]),
+           "keys": new_keys}
+    for k in P.OPTIONS:
+        new[k] = body.get(k, cur.get(k))
+    s = P.save_settings(new)
     TL.configure(s)
     S.audit("settings_changed", "proxy=" + ("да" if s["proxy"] else "нет") +
             " keys=" + ",".join(k for k, v in s["keys"].items() if v))
@@ -165,8 +327,88 @@ def api(path, q, body):
     if path == "state":
         return state(int(qv("case")))
     if path == "add":
-        sid, status = S.add_source(int(body["case"]), str(body["url"])[:2000])
-        return {"id": sid, "status": status}
+        sid, status = S.add_source(int(body["case"]), str(body["url"])[:2000], capture=capture_fn())
+        return {"id": sid, "status": status, "attachments": len(S.attachments(int(body["case"])).get(sid, []))}
+    if path == "intersections":
+        return S.intersections(int(qv("case")) if qv("case") else None)
+    if path == "dossier":
+        return S.dossier(int(qv("case")), int(qv("id")))
+    if path == "expand":
+        cid, sid = int(body["case"]), int(body["id"])
+        depth, limit = max(1, min(3, int(body.get("depth") or 1))), max(1, min(80, int(body.get("limit") or 25)))
+        return start_custom("expand", f"#{sid}", lambda job: run_expand(cid, sid, depth, limit,
+                                                                         bool(body.get("same_host", True)), job),
+                            saveable=False)
+    if path == "playbooks":
+        return [{"id": k, "title": v["title"], "ph": v["ph"], "steps": v["steps"], "archive": bool(v.get("archive"))}
+                for k, v in X.PLAYBOOKS.items()]
+    if path == "playbook":
+        cid, pid, qq = int(body["case"]), str(body["id"]), str(body.get("q", "")).strip()[:300]
+        if not qq:
+            raise ValueError("Введите значение для сценария")
+        return start_custom("playbook", qq, lambda job: run_playbook(cid, pid, qq, job), saveable=False)
+    if path == "capture":
+        sid = int(body["id"])
+        src = S.source(sid)
+        fn = capture_fn() or (lambda url: X.capture_page(url, True, True))
+        return start_custom("capture", src["url"], lambda job: {
+            "added": S.capture_into(sid, src["final_url"] or src["url"], fn)}, saveable=False)
+    if path == "brand":
+        if body:
+            cid, dom, iv = int(body["case"]), TL._host(str(body["domain"])), int(body.get("interval") or 0)
+            if not iv:
+                S.set_brand_monitor(cid, dom, 0)
+                return {"off": True}
+
+            def first(job):
+                snap = X.brand_snapshot(dom, job)
+                S.set_brand_monitor(cid, dom, iv, snap)
+                S.add_tool_result(cid, "brand_monitor", dom, {"domain": dom, "baseline": True, **snap})
+                return {"domain": dom, "lookalikes": len(snap["lookalikes"]), "subdomains": len(snap["subdomains"])}
+            return start_custom("brand", dom, first, saveable=False)
+        return [{k: v for k, v in m.items() if k != "baseline"}
+                for m in S.brand_monitors(int(qv("case")) if qv("case") else None)]
+    if path == "update_check":
+        if time.time() - UPDATE["ts"] > 6 * 3600 or qv("force"):
+            UPDATE["data"], UPDATE["ts"] = X.check_update(), time.time()
+        return UPDATE["data"]
+    if path == "ai_summary":
+        cid = int(body["case"])
+        c = S.case(cid)
+        st = P.load_settings()
+        return start_custom("ai_summary", c["name"], lambda job: (job.note("Claude анализирует кейс…"), X.ai_summary(
+            S, c, st["keys"].get("anthropic"), st.get("ai_model") or "claude-opus-5-5", st.get("proxy")))[1])
+    if path == "globe":
+        layer = qv("layer")
+        if layer == "flights":
+            bb = [float(x) for x in qv("bbox").split(",")] if qv("bbox") else None
+            return X.globe_flights(bb)
+        if layer == "sats":
+            return X.globe_satellites(qv("group") or "stations")
+        if layer == "quakes":
+            return X.globe_quakes(qv("period") or "day")
+        if layer == "events":
+            return X.globe_events()
+        if layer == "case":
+            return case_geo(int(qv("case")))
+        if layer == "groups":
+            return X.SAT_GROUPS
+        if layer == "geocode":
+            return X.geocode(qv("q"))
+        raise KeyError("Неизвестный слой")
+    if path == "globe_save":
+        obj = body.get("obj") or {}
+        sid, n = S.add_tool_result(int(body["case"]), "globe", str(body.get("label") or "объект")[:150],
+                                   {"layer": body.get("layer"), "object": obj, "observed": P.now_iso()})
+        return {"source": sid, "entities": n}
+    if path == "blob":
+        data = base64.b64decode(str(body.get("data", "")).split(",")[-1])
+        bid = uuid.uuid4().hex[:12]
+        BLOBS.clear() if len(BLOBS) > 20 else None
+        BLOBS[bid] = (data, str(body.get("ctype") or "image/png"), str(body.get("name") or "graph.png"))
+        return {"id": bid}
+    if path == "portable":
+        return make_portable()
     if path == "rel":
         S.update_source(int(body["id"]), reliability=max(1, min(5, int(body["reliability"]))))
         return {}
@@ -209,8 +451,9 @@ def api(path, q, body):
     if path == "settings":
         return settings_save(body) if body else settings_public()
     if path == "info":
-        return {"version": P.APP_VERSION, "data_dir": P.DATA_DIR, "frozen": P.FROZEN,
-                "sites": len(TL.load_sites()), "tools": len(TL.TOOLS)}
+        return {"version": P.APP_VERSION, "data_dir": P.DATA_DIR, "frozen": P.FROZEN, "portable": P.PORTABLE,
+                "sites": len(TL.load_sites()), "tools": len(TL.TOOLS), "browser": X.find_browser(),
+                "ai_models": list(X.AI_MODELS)}
     if path == "open_data_dir":
         if os.name == "nt":
             os.startfile(P.DATA_DIR)
@@ -218,7 +461,39 @@ def api(path, q, body):
     raise KeyError(path)
 
 
+def make_portable():
+    """Копирует данные в папку ProvenioData рядом с exe и создаёт portable.txt."""
+    if P.PORTABLE:
+        return {"portable": True, "message": "Уже работает в портативном режиме"}
+    import shutil
+    import sqlite3
+    dst = P.PORTABLE_DIR
+    os.makedirs(os.path.join(dst, "snapshots"), exist_ok=True)
+    with LOCK:
+        con = sqlite3.connect(os.path.join(dst, "provenio.db"))
+        S.db.backup(con)
+        con.close()
+    for name in os.listdir(S.snap_dir):
+        a, b = os.path.join(S.snap_dir, name), os.path.join(dst, "snapshots", name)
+        if not os.path.exists(b):
+            shutil.copy2(a, b)
+    if os.path.exists(P.SETTINGS_PATH):
+        shutil.copy2(P.SETTINGS_PATH, os.path.join(dst, "settings.json"))
+    with open(P.PORTABLE_MARK, "w", encoding="utf-8") as f:
+        f.write("Provenio: портативный режим. Данные хранятся в папке ProvenioData рядом с программой.\n"
+                "Удалите этот файл, чтобы вернуться к хранению в профиле пользователя.\n")
+    S.audit("portable_enabled", dst)
+    return {"portable": True, "message": f"Данные скопированы в {dst}. Перезапустите Provenio. "
+                                        "Ключи API зашифрованы для этой учётной записи Windows — "
+                                        "на другом компьютере их нужно будет ввести заново."}
+
+
 def download(kind, cid):
+    if kind == "blob":
+        data, ctype, fname = BLOBS.pop(str(cid), (None, None, None))
+        if data is None:
+            raise KeyError("Файл не найден")
+        return data, ctype, fname
     c = case_by_id(cid)
     if not c:
         raise KeyError("Кейс не найден")
@@ -233,8 +508,17 @@ def download(kind, cid):
     if kind == "csv":
         S.audit("case_exported", f"{c['name']} csv")
         return P.entities_csv(S, c).encode("utf-8"), "text/csv; charset=utf-8", f"provenio_{safe}_entities.csv"
+    if kind in ("gexf", "graphml", "edges"):
+        S.audit("graph_exported", f"{c['name']} {kind}")
+        if kind == "gexf":
+            return X.graph_gexf(S, c), "application/xml", f"provenio_{safe}.gexf"
+        if kind == "graphml":
+            return X.graph_graphml(S, c), "application/xml", f"provenio_{safe}.graphml"
+        return X.graph_edges_csv(S, c), "text/csv; charset=utf-8", f"provenio_{safe}_maltego.csv"
     if kind == "evidence":
-        data, mh = P.build_evidence_zip(S, c)
+        st = P.load_settings()
+        tsa = ((st.get("tsa_url") or "").strip() or P.TSA_DEFAULT) if st.get("tsa_enabled") else None
+        data, mh = P.build_evidence_zip(S, c, tsa_url=tsa)
         return data, "application/zip", f"provenio_{safe}_evidence_{mh[:8]}.zip"
     raise KeyError(kind)
 
@@ -296,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (KeyError, ValueError) as e:
                     return self.out(400, {"error": str(e).strip("'")})
             if u.path.startswith("/download/"):
-                data, ctype, fname = download(u.path[10:], (q.get("case") or ["0"])[0])
+                data, ctype, fname = download(u.path[10:], (q.get("case") or q.get("id") or ["0"])[0])
                 disp = "attachment" if not ctype.startswith("text/html") else "inline"
                 return self.out(200, data, ctype, [(
                     "Content-Disposition",
@@ -309,10 +593,15 @@ class Handler(BaseHTTPRequestHandler):
                 name = os.path.basename(urllib.parse.unquote(u.path[10:]))
                 with open(os.path.join(S.snap_dir, name), "rb") as f:
                     data = f.read()
+                if name.endswith((".png", ".pdf")):
+                    return self.out(200, data, "image/png" if name.endswith(".png") else "application/pdf")
                 ctype = "text/plain; charset=utf-8" if name.endswith(".json") else "text/html"
                 return self.out(200, data, ctype, [(
                     "Content-Security-Policy",
                     "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")])
+            if u.path == "/static/world.json":
+                with open(TL.res_path(os.path.join("assets", "world-110m.json")), "rb") as f:
+                    return self.out(200, f.read(), "application/json")
             self.out(404, {"error": "not found"})
         except Exception as e:
             traceback.print_exc()
@@ -341,7 +630,10 @@ def _single_instance():
     import ctypes
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.restype = ctypes.c_void_p
-    handle = kernel32.CreateMutexW(None, False, "Local\\ProvenioOSINT_SingleInstance")
+    # один экземпляр на папку данных: портативная копия или другой PROVENIO_DATA не мешают друг другу
+    import hashlib
+    tag = hashlib.md5(os.path.abspath(P.DATA_DIR).lower().encode("utf-8")).hexdigest()[:10]
+    handle = kernel32.CreateMutexW(None, False, "Local\\ProvenioOSINT_" + tag)
     globals()["_MUTEX"] = handle   # держим дескриптор до выхода
     return kernel32.GetLastError() != 183   # ERROR_ALREADY_EXISTS
 
@@ -406,6 +698,7 @@ PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
  --glass:saturate(150%) blur(22px);
 }
 *{box-sizing:border-box;margin:0}
+[hidden]{display:none!important}
 html,body{height:100%}
 body{font:14px/1.55 "Inter","Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--tx);
  height:100vh;overflow:hidden;display:grid;grid-template-columns:272px 1fr;
@@ -635,6 +928,46 @@ table.t{width:100%;border-collapse:collapse;font-size:12px}table.t td,table.t th
 table.t th{color:var(--ac2);font-weight:600}
 .batch textarea{min-height:90px;resize:vertical;font-family:Consolas,monospace;font-size:12px}
 .sec{margin-top:9px}.sec>b{color:var(--ac2);display:block;margin-bottom:4px}
+/* ---------- 2.1: глобус, радар, утечки ---------- */
+#p-globe{height:calc(100vh - 300px);min-height:440px;border-radius:18px;overflow:hidden;border:1px solid var(--bd);
+ background:radial-gradient(circle at 50% 50%,#120a22 0%,#05040a 70%);padding:0;position:relative}
+#gcv{width:100%;height:100%;display:block;cursor:grab}
+.ghud{position:absolute;left:14px;top:14px;width:250px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;
+ background:rgba(14,9,26,.72);max-height:calc(100% - 28px);overflow:auto}
+.gtitle{font-weight:800;letter-spacing:.6px;display:flex;justify-content:space-between;align-items:center}
+.gtitle span{font:600 11px Consolas,monospace;color:var(--ac2)}
+.gl{display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--mu);cursor:pointer;padding:3px 0}
+.gl input{width:auto;accent-color:var(--ac)}.gl b{margin-left:auto;color:var(--tx);font:600 11px Consolas,monospace}
+.ghud select,.ghud input[type=text],#gq{padding:7px 10px;font-size:12px}
+#gres div{padding:6px 8px;border-radius:8px;font-size:11.5px;cursor:pointer;color:var(--mu)}#gres div:hover{background:rgba(139,92,246,.2);color:#fff}
+.ginfo{position:absolute;right:14px;top:14px;width:300px;padding:14px;display:none;background:rgba(14,9,26,.8);max-height:calc(100% - 28px);overflow:auto}
+.ginfo.show{display:block;animation:pop .3s var(--spring)}
+.ginfo h4{font-size:15px;margin-bottom:6px;display:flex;gap:8px;align-items:center}.ginfo h4 .x{margin-left:auto;cursor:pointer;color:var(--mu);background:none;border:0;font-size:16px}
+.gcoord{position:absolute;right:16px;bottom:12px;font:11px Consolas,monospace;color:var(--mu2);pointer-events:none;text-align:right}
+.gcred{position:absolute;left:16px;bottom:12px;font-size:10.5px;color:var(--mu2);pointer-events:none}
+.bigin{display:flex;flex-direction:column;gap:11px;margin-bottom:16px}
+.bigin textarea{min-height:70px;resize:vertical;font-family:Consolas,monospace;font-size:12.5px}
+.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px}
+.rcard{border-left:3px solid var(--c);animation:rise .5s var(--ease) both;display:flex;flex-direction:column;gap:9px}
+.ring{width:58px;height:58px;border-radius:50%;flex-shrink:0;display:grid;place-items:center;
+ background:conic-gradient(var(--c) calc(var(--p)*1%),rgba(255,255,255,.07) 0)}
+.ring b{width:46px;height:46px;border-radius:50%;background:#0d0918;display:grid;place-items:center;font-size:16px}
+.rip{font:700 17px Consolas,monospace}.rv{font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
+.mode{display:flex;gap:6px}
+.lhead{display:flex;gap:16px;align-items:center;margin-bottom:14px}
+.lhead .big{font-size:40px;font-weight:800;line-height:1}
+.lgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-top:12px}
+.lcard{display:flex;flex-direction:column;gap:6px;animation:rise .5s var(--ease) both}
+.lcard img{width:34px;height:34px;border-radius:9px;object-fit:contain;background:#fff;padding:3px}
+.md h1,.md h2,.md h3{margin:14px 0 6px;font-size:15px;color:var(--ac2)}.md p{margin:6px 0}.md ul{margin:4px 0 4px 18px}
+.md table{border-collapse:collapse;width:100%;font-size:12px;margin:6px 0}.md td,.md th{border-bottom:1px solid rgba(255,255,255,.07);padding:5px 7px;text-align:left}
+.md code{font-family:Consolas,monospace;background:rgba(255,255,255,.06);padding:1px 5px;border-radius:5px}
+.upd{background:linear-gradient(135deg,rgba(52,211,153,.18),rgba(34,211,238,.1));border-color:rgba(52,211,153,.5);color:var(--ok)}
+.pbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:9px;margin-bottom:12px}
+.pb{padding:11px 13px;border-radius:13px;border:1px solid var(--bd);background:var(--card);cursor:pointer;transition:all .25s var(--spring)}
+.pb:hover{transform:translateY(-2px);border-color:var(--bd2)}.pb.on{border-color:var(--ac);background:rgba(139,92,246,.2)}
+.pb b{display:block}.pb small{color:var(--mu);font-size:11px}
+.ent{cursor:pointer}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(168,130,255,.2);border-radius:9px}
@@ -649,7 +982,10 @@ table.t th{color:var(--ac2);font-weight:600}
  <div class="hint">Доказательная OSINT-аналитика.<br>Только публичные данные. Соблюдайте закон.</div>
  <div class="side-foot">
   <button class="ghost" id="set">⚙ Настройки и ключи API</button>
+  <button class="ghost" id="inter">🔀 Пересечения кейсов</button>
+  <button class="ghost" id="brandb">🛡 Мониторинг бренда</button>
   <button class="ghost" id="ddir">📁 Папка данных</button>
+  <a class="ghost upd" id="updb" target="_blank" rel="noopener" hidden></a>
   <span class="ver">Provenio __VER__</span>
  </div>
 </aside>
@@ -658,6 +994,8 @@ table.t th{color:var(--ac2);font-weight:600}
   <input class="grow" id="url" placeholder="Вставьте URL (можно несколько через пробел или запятую)…">
   <button class="btn" id="add">Архивировать</button>
   <button class="ghost" id="ver">Проверить</button>
+  <button class="ghost" id="pbb">▶ Сценарий</button>
+  <button class="ghost" id="aib">✨ ИИ-сводка</button>
   <button class="ghost" id="cmp">Сравнить</button>
   <button class="ghost" id="rep">Экспорт ▾</button>
   <span class="pill ok" id="pill">целостность</span>
@@ -673,6 +1011,9 @@ table.t th{color:var(--ac2);font-weight:600}
   <button class="tab" data-t="ents">Сущности</button>
   <button class="tab" data-t="graph">Граф</button>
   <button class="tab" data-t="time">Хронология</button>
+  <button class="tab" data-t="globe">Глобус</button>
+  <button class="tab" data-t="radar">IP-радар</button>
+  <button class="tab" data-t="leaks">Утечки</button>
   <button class="tab" data-t="tools">Инструменты</button>
   <button class="tab" data-t="audit">Аудит</button>
   <span id="ink"></span>
@@ -696,6 +1037,42 @@ table.t th{color:var(--ac2);font-weight:600}
    <div class="tgrid" id="tgrid"></div>
   </div>
   <div class="panel" id="p-audit"><div class="tl" id="tl"></div></div>
+  <div class="panel" id="p-globe"><canvas id="gcv"></canvas>
+   <div class="ghud card">
+    <div class="gtitle">◉ ГЛОБУС <span id="gclock"></span></div>
+    <div><input id="gq" type="text" placeholder="Найти место (Enter)…"><div id="gres"></div></div>
+    <label class="gl"><input type="checkbox" data-l="flights" checked> ✈ Самолёты <b id="gn-flights">—</b></label>
+    <label class="gl"><input type="checkbox" data-l="sats" checked> 🛰 Спутники <b id="gn-sats">—</b></label>
+    <select id="ggroup"></select>
+    <label class="gl"><input type="checkbox" data-l="quakes" checked> 〰 Землетрясения <b id="gn-quakes">—</b></label>
+    <label class="gl"><input type="checkbox" data-l="events"> 🔥 События NASA <b id="gn-events">—</b></label>
+    <label class="gl"><input type="checkbox" data-l="cas" checked> ◆ Объекты кейса <b id="gn-cas">—</b></label>
+    <label class="gl"><input type="checkbox" id="gnight" checked> 🌗 День и ночь</label>
+    <label class="gl"><input type="checkbox" id="gauto" checked> ⟳ Вращение</label>
+    <div class="pmsg" id="gstat"></div>
+   </div>
+   <div class="ginfo card" id="ginfo"></div>
+   <div class="gcoord" id="gcoord"></div>
+   <div class="gcred">Данные: OpenSky · CelesTrak · USGS · NASA EONET · OpenStreetMap · ip-api · идея — God's Eye View</div>
+  </div>
+  <div class="panel" id="p-radar">
+   <div class="card bigin"><div class="tool"><div class="th"><div class="ic">📡</div><div><div class="tn">IP-радар</div>
+    <div class="td">Один понятный вердикт на каждый IP: ~20 открытых списков угроз (FireHOL, Spamhaus, IPsum, Feodo, C2-фиды…),
+    Tor, VPN/прокси, облака и CDN, гео и ASN, порты и CVE (Shodan InternetDB), OTX, DNSBL. Списки кэшируются локально на 12 ч.</div></div></div></div>
+    <textarea id="rq" placeholder="IP-адреса через пробел, запятую или с новой строки (до 50). Понимает 1[.]2[.]3[.]4"></textarea>
+    <div class="row"><button class="btn" id="rgo">Сканировать</button><button class="ghost" id="rcase">IP из кейса</button>
+     <button class="ghost" id="rsave" hidden>＋ В кейс</button><button class="ghost" id="rstop" hidden>■ Стоп</button><span class="pmsg grow" id="rmsg"></span></div>
+    <div class="prog" id="rprog" hidden><i></i></div></div>
+   <div id="rres"></div></div>
+  <div class="panel" id="p-leaks">
+   <div class="card bigin"><div class="tool"><div class="th"><div class="ic">💧</div><div><div class="tn">Утечки данных · XposedOrNot</div>
+    <div class="td">Email — в каких утечках он есть, какие данные раскрыты и насколько это опасно. Домен — известные утечки сервиса.
+    Пароль — проверка по k-anonymity: в сеть уходят только 10 символов его хэша.</div></div></div></div>
+    <div class="row"><div class="mode" id="lmode"><span class="fc on" data-m="email">Email</span><span class="fc" data-m="domain">Домен</span><span class="fc" data-m="password">Пароль</span></div></div>
+    <div class="row"><input id="lq" class="grow" placeholder="user@example.com"><button class="btn" id="lgo">Проверить</button>
+     <button class="ghost" id="lsave" hidden>＋ В кейс</button></div>
+    <div class="pmsg" id="lmsg">Лимит бесплатного API: 25 запросов в час. Email отправляется в XposedOrNot.</div></div>
+   <div id="lres"></div></div>
  </div>
 </main>
 <div id="toasts"></div>
@@ -714,7 +1091,8 @@ function num(el,to){const f=+el.dataset.v||0;el.dataset.v=to;const t0=performanc
  (function s(t){const p=Math.min(1,(t-t0)/850),e=1-Math.pow(1-p,3);el.textContent=Math.round(f+(to-f)*e);if(p<1)requestAnimationFrame(s)})(t0)}
 function moveInk(){const b=$(".tab.on"),k=$("#ink");if(!b)return;k.style.width=b.offsetWidth+"px";k.style.transform="translateX("+(b.offsetLeft-28)+"px)"}
 function setTab(t){tab=t;$$(".tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
- $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(sizeCv,30);if(t==="time")renderTimeline()}
+ $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(sizeCv,30);if(t==="time")renderTimeline();
+ if(t==="globe")setTimeout(globeOpen,30)}
 $$(".tab").forEach(b=>b.onclick=()=>setTab(b.dataset.t));
 
 function renderCases(){$("#cases").innerHTML=cases.map((c,i)=>`<div class="case ${cur&&cur.id===c.id?"on":""}" data-id="${c.id}" style="animation-delay:${i*40}ms">${esc(c.name)}</div>`).join("")||'<div class="mu" style="padding:8px;color:var(--mu2)">Создайте первый кейс ↓</div>'}
@@ -723,7 +1101,8 @@ async function loadCases(sel){cases=await api("cases");cur=cases.find(c=>c.id===
 $("#addc").onclick=async()=>{const n=$("#ncase").value.trim();if(!n)return;try{const r=await api("case",{name:n});$("#ncase").value="";await loadCases(r.id);toast("Кейс создан","ok")}catch(e){toast(e.message,"bad")}};
 $("#ncase").onkeydown=e=>{if(e.key==="Enter")$("#addc").click()};
 
-async function refresh(){if(!cur)return;st=await api("state?case="+cur.id);render()}
+async function refresh(){if(!cur)return;st=await api("state?case="+cur.id);render();
+ if(GV.inited&&GV.L.cas.on&&GV.L.cas.cid!==cur.id){GV.L.cas.cid=cur.id;gLoad("cas")}}
 function render(){
  if(!st||!cur){$("#p-src").innerHTML='<div class="empty"><b>Нет активного кейса</b>Создайте кейс слева и добавьте первый URL</div>';return}
  const E=st.entities,multi=E.filter(e=>e.src.length>1).length,avg=E.length?Math.round(E.reduce((a,e)=>a+e.conf,0)/E.length):0;
@@ -733,7 +1112,7 @@ function render(){
  $("#p-src").innerHTML=st.sources.map((s,i)=>{const tool=s.kind==="tool",tn=tool?(TOOLS.find(t=>t.id===s.tool)||{}).tn||s.tool:"";
   return `<div class="card src ${tool?"kind-tool":""}" style="--i:${Math.min(i,30)}"><div class="row"><div class="grow">
   <div class="ttl">${tool?'<span class="badge">🛠 '+esc(tn)+'</span> '+esc(s.query||""):esc(s.title||host(s.url))}
-   ${s.parent_id?'<span class="badge">версия #'+s.parent_id+'</span>':""}${s.monitor?'<span class="badge mon">👁 каждые '+s.monitor.interval+' мин · изменений: '+s.monitor.changes+'</span>':""}</div>
+   ${s.found_on?'<span class="badge">найдено на #'+s.found_on+'</span>':""}${s.parent_id?'<span class="badge">версия #'+s.parent_id+'</span>':""}${s.monitor?'<span class="badge mon">👁 каждые '+s.monitor.interval+' мин · изменений: '+s.monitor.changes+'</span>':""}</div>
   ${tool?`<span class="url" style="color:var(--mu)">${esc(s.url)}</span>`:`<a class="url" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.url)}</a>`}</div>
   <span class="chip ${s.status.startsWith("OK")?"ok":"bad"}">${esc(s.status.slice(0,34))}</span></div>
   <div class="meta"><span>#${s.id}</span><span>${esc(s.fetched)}</span><span>${(s.size/1024).toFixed(1)} KB</span>
@@ -742,6 +1121,9 @@ function render(){
   <div class="row"><div class="seg" data-id="${s.id}" title="Надёжность источника">${[1,2,3,4,5].map(n=>`<button data-r="${n}" class="${n<=s.reliability?"on":""}">${n}</button>`).join("")}</div>
   <input class="note" data-id="${s.id}" placeholder="Заметка…" value="${esc(s.note)}">
   ${s.snapshot?`<a class="ghost" target="_blank" href="/snapshot/${encodeURIComponent(s.snapshot)}?t=${T}">${tool?"JSON":"Снимок"}</a>`:""}
+  ${(s.att||[]).map(a=>`<a class="ghost" target="_blank" title="SHA-256 ${esc(a.sha256)}" href="/snapshot/${encodeURIComponent(a.file)}?t=${T}">${a.kind==="screenshot"?"📷 Скриншот":"📄 PDF"}</a>`).join("")}
+  ${!tool&&s.status.startsWith("OK")&&!(s.att||[]).length?`<button class="ghost cap" data-id="${s.id}">📷 Снять экран</button>`:""}
+  ${!tool&&s.status.startsWith("OK")?`<button class="ghost exp" data-id="${s.id}">🔗 Обойти ссылки</button>`:""}
   ${!tool&&!s.parent_id?`<button class="ghost mon ${s.monitor?"on":""}" data-id="${s.id}">${s.monitor?"👁 Слежу":"👁 Следить"}</button>`:""}
   ${s.monitor?`<button class="ghost chk" data-id="${s.id}">Проверить сейчас</button>`:""}
   ${s.versions||s.parent_id?`<button class="ghost vers" data-id="${s.id}">Версии и сравнение</button>`:""}
@@ -750,6 +1132,9 @@ function render(){
  $("#tl").innerHTML=st.audit.map((a,i)=>`<div class="ev2" style="--i:${Math.min(i,20)}"><b>${esc(a.action)}</b> <span style="color:var(--mu)">${esc(a.ts)}</span><br>${esc(a.detail)}<br><small>${esc(a.hash)}</small></div>`).join("");
  buildGraph();moveInk();if(tab==="time")renderTimeline()}
 $("#p-src").onclick=async e=>{const b=e.target.closest("button,.sha")||e.target;
+ if(b.classList.contains("cap")){b.classList.add("loading");try{const r=await api("capture",{id:b.dataset.id});const f=await waitJob(r.id);
+  toast(f.state==="done"&&f.result.added?"Скриншот сохранён как доказательство":"Не удалось снять экран: "+(f.error||"браузер не ответил"),f.state==="done"&&f.result.added?"ok":"bad")}catch(x){toast(x.message,"bad")}refresh();return}
+ if(b.classList.contains("exp")){openExpand(+b.dataset.id);return}
  if(b.classList.contains("mon")){const id=b.dataset.id;const r=b.getBoundingClientRect();
   showMenu(r.left,r.bottom+4,[["Следить за изменениями страницы",null],...[[15,"каждые 15 минут"],[60,"каждый час"],[360,"каждые 6 часов"],[1440,"раз в сутки"]].map(([m,l])=>[l,async()=>{await api("monitor",{id,interval:m});toast("Мониторинг включён: "+l,"ok");refresh()}]),
    ["Выключить мониторинг",async()=>{await api("monitor",{id,interval:0});toast("Мониторинг выключен","ok");refresh()}],
@@ -767,11 +1152,12 @@ function renderEnts(){const types=[...new Set(st.entities.map(e=>e.type))];
  '<input id="eq" placeholder="Поиск…" style="margin-left:auto;max-width:220px;padding:7px 13px" value="'+esc(eq)+'">';
  const L=st.entities.filter(e=>(ef==="all"||e.type===ef)&&e.value.toLowerCase().includes(eq)).sort((a,b)=>b.conf-a.conf);
  $("#ents").innerHTML=L.map((e,i)=>{const g=e.conf>=75?"#34d399,#22d3ee":e.conf>=45?"#fbbf24,#fb923c":"#f87171,#fb7185";
- return `<div class="ent" style="--i:${Math.min(i,25)}"><span class="dot" style="background:${TY[e.type]};color:${TY[e.type]}"></span><span style="color:var(--mu)">${TL[e.type]||e.type}</span>
- <span class="ev" title="${esc(e.value)}">${esc(e.value)}</span><div class="bar"><i data-w="${e.conf}" style="background:linear-gradient(90deg,${g})"></i></div><b>${e.conf}%</b><span style="color:var(--mu)">${e.src.length} ист.</span></div>`}).join("")||'<div class="empty">Ничего не найдено</div>';
+ return `<div class="ent" data-id="${e.id}" style="--i:${Math.min(i,25)}"><span class="dot" style="background:${TY[e.type]};color:${TY[e.type]}"></span><span style="color:var(--mu)">${TL[e.type]||e.type}</span>
+ <span class="ev" title="${esc(e.value)}">${(e.other||[]).length?`<span class="badge" title="Также в кейсах: ${esc(e.other.join(", "))}">🔀 ${e.other.length}</span> `:""}${esc(e.value)}</span><div class="bar"><i data-w="${e.conf}" style="background:linear-gradient(90deg,${g})"></i></div><b>${e.conf}%</b><span style="color:var(--mu)">${e.src.length} ист.</span></div>`}).join("")||'<div class="empty">Ничего не найдено</div>';
  requestAnimationFrame(()=>requestAnimationFrame(()=>$$(".bar i").forEach(b=>b.style.width=b.dataset.w+"%")));
  const q=$("#eq");if(q)q.oninput=()=>{eq=q.value.toLowerCase();const p=q.selectionStart;renderEnts();const n=$("#eq");n.focus();n.setSelectionRange(p,p)}}
 $("#chips").onclick=e=>{const c=e.target.closest(".fc");if(c){ef=c.dataset.t;renderEnts()}};
+$("#ents").onclick=e=>{const r=e.target.closest(".ent");if(r)openDossier(+r.dataset.id)};
 
 /* ---------- граф с физикой ---------- */
 const cv=$("#cv"),cx=cv.getContext("2d"),G={nodes:[],edges:[],drag:null,hover:null};let W=0,H=0;const dpr=window.devicePixelRatio||1;
@@ -812,9 +1198,9 @@ requestAnimationFrame(tick);
 
 /* =================== ПИВОТЫ (Maltego-подобно) =================== */
 const PIVOTS={
- domain:["site_recon","dns","whois","subdomains","harvester","lookalikes","tracking","domain_history","reputation","email_sec","wayback_urls","secrets"],
- ip:["ip_info","internetdb","asn","reputation","reverse_dns","reverse_ip"],
- email:["email","reputation"],
+ domain:["site_recon","dns","whois","subdomains","harvester","lookalikes","phishing","tracking","domain_history","reputation","leaks","email_sec","wayback_urls","secrets"],
+ ip:["ip_radar","ip_info","internetdb","asn","reputation","reverse_dns","reverse_ip"],
+ email:["email","leaks","reputation"],
  phone:["phone"],
  account:["username","github","telegram"]};
 function pivotMenu(n,x,y){
@@ -823,7 +1209,8 @@ function pivotMenu(n,x,y){
  let q=e.value,list=PIVOTS[e.type]||[];
  if(e.type==="account"){const[net,name]=e.value.split(":");q=name;list=net==="github"?["github","username"]:net==="telegram"?["telegram","username"]:["username"]}
  if(e.type==="email")list=list.concat([["domain",e.value.split("@")[1]]]);
- const items=[[`${TL[e.type]||e.type}: ${e.value}`,null]];
+ const items=[[`${TL[e.type]||e.type}: ${e.value}`,null],["🗂 Досье сущности",()=>openDossier(e.id)]];
+ if(e.type==="ip")items.push(["🌍 Показать на глобусе",()=>{setTab("globe");setTimeout(()=>globeFindIp(e.value),200)}]);
  for(const it of list){if(Array.isArray(it)){const v=it[1];PIVOTS.domain.slice(0,5).forEach(id=>{const t=TOOLS.find(t=>t.id===id);items.push([`${t.ic||"🔧"} ${t.tn} → ${v}`,()=>runPivot(id,v,e)])});continue}
   const t=TOOLS.find(t=>t.id===it);if(t)items.push([`${t.ic||"🔧"} ${t.tn}`,()=>runPivot(it,q,e)])}
  items.push(["📋 Копировать значение",()=>{navigator.clipboard&&navigator.clipboard.writeText(e.value);toast("Скопировано","ok")}]);
@@ -879,6 +1266,12 @@ async function showDiff(a,bb,el){el.innerHTML='<div class="prog ind"><i></i></di
 
 /* =================== ИНСТРУМЕНТЫ =================== */
 const TOOLS=[
+ {id:"phishing",cat:"Информационная безопасность",ic:"🎣",tn:"Проверка ссылки на фишинг",td:"Риск 0–100: признаки в адресе, бренд-двойник, возраст домена, сертификат, редиректы, форма пароля, репутация",ph:"https://подозрительная.ссылка",wide:1},
+ {id:"ip_radar",cat:"Информационная безопасность",ic:"📡",tn:"IP-радар",td:"Вердикт по IP из ~20 открытых источников: угрозы, C2, Tor, VPN, облака, гео (можно список; есть отдельная вкладка)",ph:"1.2.3.4, 5.6.7.8"},
+ {id:"leaks",cat:"OSINT: люди",ic:"💧",tn:"Утечки (XposedOrNot)",td:"Email, домен или пароль: в каких утечках, какие данные, уровень риска",ph:"user@example.com · домен · пароль"},
+ {id:"capture",cat:"Разведка сайта",ic:"📷",tn:"Скриншот и PDF страницы",td:"Снимок через Edge без окна — как страницу видит человек",ph:"https://example.com"},
+ {id:"import_file",cat:"Файлы и медиа",ic:"📥",tn:"Импорт Sherlock / SpiderFoot",td:"Загрузите результат другого инструмента (txt/csv/json) — находки попадут в кейс и граф",ph:"выберите файл →",file:1,fileOnly:1,accept:".txt,.csv,.json"},
+ {id:"tsa",cat:"Файлы и медиа",ic:"⏳",tn:"Метка времени RFC 3161",td:"Независимая служба подписывает хэш файла или текста — доказательство, что он существовал к этому моменту",ph:"текст или выберите файл",file:1},
  {id:"harvester",cat:"Разведка организации",ic:"🌾",tn:"Харвестер (как theHarvester)",td:"Email, поддомены и хосты организации из CT-логов, Wayback, HackerTarget и страниц сайта",ph:"example.com",wide:1},
  {id:"lookalikes",cat:"Разведка организации",ic:"🎭",tn:"Двойники домена (как dnstwist)",td:"Опечатки, гомоглифы, смена зоны — какие похожие домены уже зарегистрированы (фишинг)",ph:"example.com",wide:1},
  {id:"tracking",cat:"Разведка организации",ic:"🧷",tn:"Связанные сайты по ID счётчиков",td:"Google Analytics, AdSense, Метрика, Pixel, верификации, favicon. Несколько URL через запятую — покажет общие ID",ph:"site1.com, site2.com",wide:1},
@@ -1045,6 +1438,16 @@ function fmtAny(d,depth){depth=depth||0;if(d==null)return'<span class="mu">—</
  return esc(d)}
 const SEVC={"критический":"c","высокий":"h","средний":"m","инфо":"i"};
 function fmtTool(id,d,body){
+ if(id==="phishing")return phishView(d);
+ if(id==="ip_radar")return radarView(d,true);
+ if(id==="leaks")return leaksView(d);
+ if(id==="capture")return (d.files||[]).map(f=>f.data_b64?`<img src="data:image/png;base64,${f.data_b64}" style="width:100%;border-radius:10px;border:1px solid var(--bd);margin:6px 0">`:kv(f.kind.toUpperCase(),(f.size/1024).toFixed(1)+" KB · sha256 "+f.sha256.slice(0,20)+"…")).join("")+'<div class="pmsg">Чтобы сохранить скриншот как доказательство, архивируйте страницу в кейс — снимок экрана сделается автоматически.</div>';
+ if(id==="import_file"){let h=kv("Файл",d.file)+kv("Формат",d.format)+kv("SHA-256",d.sha256);
+  if(d.found)h+=sec("Найдено профилей: "+d.found.length,d.found.slice(0,200).map(x=>`<div class="kv"><b>${esc(x.site||"")}</b><span>${lnk(x.url)}</span></div>`).join(""));
+  if(d.types)h+=sec("Событий: "+d.events,Object.entries(d.types).map(([k,v])=>`<span class="tag">${esc(k)} ×${v}</span>`).join(""));
+  if(d.iocs)h+=Object.entries(d.iocs).map(([k,v])=>sec(k.toUpperCase()+" ("+v.length+")",tags(v))).join("");
+  return h+'<div class="pmsg">Нажмите «В кейс» — находки станут сущностями графа, а сам файл будет учтён по SHA-256.</div>'}
+ if(id==="tsa")return kv("Объект",d.name)+kv("SHA-256",d.sha256)+`<div class="kv"><b>Время метки</b><span style="font-weight:800;color:var(--ok)">${esc(d.gen_time)}</span></div>`+kv("Служба (TSA)",d.tsa)+kv("Серийный номер",d.serial)+`<div class="pmsg">${esc(d.note)}</div>`;
  if(id==="harvester")return kv("Источники",(d.sources||[]).join(", "))+(Object.keys(d.errors||{}).length?kv("Недоступны",Object.keys(d.errors).join(", ")):"")+
   kv("Хостов",`${d.hosts_total} (отвечают: ${d.hosts_alive})`)+sec("Email ("+(d.emails||[]).length+")",tags(d.emails))+
   sec("Хосты и IP",tbl(["Хост","IP"],(d.hosts||[]).slice(0,300).map(h=>[esc(h.host),h.ips.length?esc(h.ips.join(", ")):'<span class="notfound">не резолвится</span>'])))+
@@ -1221,22 +1624,351 @@ function dl(kind){if(!cur)return;const a=document.createElement("a");a.href=`/do
  if(kind==="report")a.target="_blank";else a.download="";document.body.append(a);a.click();a.remove();setTimeout(refresh,800)}
 $("#rep").onclick=e=>{e.stopPropagation();if(!cur)return toast("Сначала выберите кейс","bad");const r=e.target.getBoundingClientRect();
  showMenu(r.left,r.bottom+6,[["Экспорт кейса",null],["📄 Отчёт HTML (откроется в браузере)",()=>dl("report")],["🧾 Пакет доказательств ZIP",()=>dl("evidence")],
-  ["{ } Весь кейс JSON",()=>dl("json")],["📊 Сущности CSV (Excel)",()=>dl("csv")]])};
+  ["{ } Весь кейс JSON",()=>dl("json")],["📊 Сущности CSV (Excel)",()=>dl("csv")],["Граф связей",null],
+  ["🕸 GEXF — для Gephi",()=>dl("gexf")],["🕸 GraphML — yEd, Gephi, Cytoscape",()=>dl("graphml")],["🕸 Таблица связей CSV — Maltego",()=>dl("edges")],
+  ["🖼 Картинка графа PNG",exportPng]])};
 $("#cmp").onclick=openCompare;
 $("#ddir").onclick=async()=>{const i=await api("info");try{await api("open_data_dir",{})}catch(x){}toast("Данные: "+i.data_dir,"ok")};
 $("#set").onclick=openSettings;
-const KEYN={shodan:"Shodan",virustotal:"VirusTotal",abuseipdb:"AbuseIPDB",urlscan:"urlscan.io",otx:"AlienVault OTX",github:"GitHub token"};
+const KEYN={shodan:"Shodan",virustotal:"VirusTotal",abuseipdb:"AbuseIPDB",urlscan:"urlscan.io",otx:"AlienVault OTX",github:"GitHub token",anthropic:"Claude API (Anthropic)"};
+const chk=(id,on,t)=>`<label class="gl" style="color:var(--tx)"><input type="checkbox" id="${id}" ${on?"checked":""}> ${t}</label>`;
 async function openSettings(){const s=await api("settings"),i=await api("info");
  const b=modal("Настройки",`<div class="hint" style="margin-bottom:10px">Все ключи необязательны: без них работают бесплатные источники. Ключи хранятся только на этом компьютере,
   зашифрованные средствами Windows (DPAPI) — их может расшифровать только ваша учётная запись.</div>
   <div class="frow"><label>Прокси (HTTP/HTTPS)</label><input id="sproxy" placeholder="http://127.0.0.1:8080" value="${esc(s.proxy)}"></div>
   <div class="frow"><label>Таймаут запросов, с</label><input id="stime" type="number" min="5" max="120" value="${esc(s.timeout)}"></div>
   ${Object.keys(KEYN).map(k=>`<div class="frow"><label>${KEYN[k]}</label><input data-k="${k}" class="skey" placeholder="не задан" value="${esc(s.keys[k]||"")}"></div>`).join("")}
+  <div class="frow"><label>Модель для ИИ-сводки</label><select id="smodel">${(i.ai_models||[]).map(m=>`<option ${m===s.ai_model?"selected":""}>${m}</option>`).join("")}</select></div>
+  <div class="sec" style="margin-top:14px"><b>Архивация страниц</b>
+   ${chk("scap",s.capture_screenshot,"Сохранять скриншот страницы (PNG) как доказательство")}
+   ${chk("spdf",s.capture_pdf,"Сохранять страницу в PDF")}
+   <div class="hint">${i.browser?"Браузер для снимков: "+esc(i.browser):"⚠ Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
+  <div class="sec"><b>Метка времени RFC 3161 для пакета доказательств</b>
+   ${chk("stsa",s.tsa_enabled,"Заверять manifest.json у независимой службы времени (TSA)")}
+   <div class="frow"><label>Служба TSA</label><input id="stsau" placeholder="http://timestamp.digicert.com (по умолчанию)" value="${esc(s.tsa_url||"")}"></div></div>
+  <div class="sec"><b>Прочее</b>${chk("supd",s.check_updates,"Проверять обновления на GitHub при запуске")}</div>
+  <div class="sec"><b>Портативный режим</b><div class="hint">${i.portable?"✓ Включён: данные хранятся в папке ProvenioData рядом с программой.":"Данные в профиле пользователя: "+esc(i.data_dir)}</div>
+   ${i.portable?"":`<button class="ghost" id="sport" style="margin-top:6px">💾 Перенести данные к программе (флешка)</button>`}</div>
   <div class="row" style="margin-top:14px"><button class="btn" id="ssave">Сохранить</button><span class="pmsg">Provenio ${esc(i.version)} · инструментов: ${i.tools} · сайтов для поиска по нику: ${i.sites}<br>Данные: ${esc(i.data_dir)}</span></div>`);
  b.querySelector("#ssave").onclick=async()=>{const keys={};b.querySelectorAll(".skey").forEach(x=>keys[x.dataset.k]=x.value);
-  try{await api("settings",{proxy:b.querySelector("#sproxy").value,timeout:+b.querySelector("#stime").value||15,keys});toast("Настройки сохранены","ok");closeModal()}catch(x){toast(x.message,"bad")}}}
+  const g=id=>b.querySelector(id);
+  try{await api("settings",{proxy:g("#sproxy").value,timeout:+g("#stime").value||15,keys,ai_model:g("#smodel").value,
+   capture_screenshot:g("#scap").checked,capture_pdf:g("#spdf").checked,tsa_enabled:g("#stsa").checked,tsa_url:g("#stsau").value,check_updates:g("#supd").checked});
+   toast("Настройки сохранены","ok");closeModal()}catch(x){toast(x.message,"bad")}};
+ const sp=b.querySelector("#sport");if(sp)sp.onclick=async()=>{if(!confirm("Скопировать все данные в папку ProvenioData рядом с программой и включить портативный режим?"))return;
+  try{const r=await api("portable",{});toast(r.message,"ok");closeModal()}catch(x){toast(x.message,"bad")}}}
+
+/* =================== 2.1: ДОСЬЕ =================== */
+async function openDossier(id){if(!cur)return;let d;try{d=await api(`dossier?case=${cur.id}&id=${id}`)}catch(x){return toast(x.message,"bad")}
+ const e=d.entity,col=d.confidence>=75?"var(--ok)":d.confidence>=45?"var(--warn)":"var(--bad)";
+ const b=modal(`🗂 Досье: ${esc(e.value)}`,`<div class="row" style="margin-bottom:10px"><span class="badge">${esc(TL[e.type]||e.type)}</span>
+  <span class="pill" style="color:${col}">достоверность ${d.confidence}% · ${esc(d.label)}</span><span class="pill">источников: ${d.sources.length}</span>
+  ${d.domains.length?`<span class="pill">независимых доменов: ${d.domains.length}</span>`:""}</div>
+  <div class="row" id="dtools" style="margin-bottom:8px"></div>
+  ${d.other_cases.length?sec("🔀 Встречается в других кейсах",d.other_cases.map(c=>`<span class="tag good">${esc(c.name)}</span>`).join("")):""}
+  ${sec("Источники",tbl(["#","Что","Когда","Надёжн."],d.sources.map(s=>[s.id,(s.kind==="tool"?"🛠 "+esc(s.tool)+": "+esc(s.query):esc(s.title||s.url))+`<br><small class="mu">${esc(s.url)}</small>`,esc(s.fetched),s.reliability+"/5"])))}
+  ${d.context.length?sec("Контекст упоминаний",d.context.map(c=>`<div class="pmsg" style="border-left:2px solid var(--bd2);padding-left:8px;margin:6px 0"><b>#${c.source}</b> ${esc(c.text)}</div>`).join("")):""}
+  ${d.related.length?sec("Связанные сущности (общие источники)",d.related.map(r=>`<span class="tag" style="cursor:pointer" data-rid="${r.id}">${esc(TL[r.type]||r.type)}: ${esc(r.value)} ×${r.shared}</span>`).join("")):""}
+  ${d.timeline.length?sec("Хронология",d.timeline.map(t=>`<div class="kv"><b style="font-family:Consolas,monospace">${esc(t.date)}</b><span>${esc(t.label)} <span class="mu">#${t.source}</span></span></div>`).join("")):""}`);
+ let q=e.value,list=PIVOTS[e.type]||[];if(e.type==="account"){q=e.value.split(":")[1];list=["username","github","telegram"]}
+ b.querySelector("#dtools").innerHTML=list.map(id=>{const t=TOOLS.find(t=>t.id===id);return t?`<button class="ghost" data-tid="${id}">${t.ic} ${esc(t.tn)}</button>`:""}).join("");
+ b.onclick=ev=>{const t=ev.target.closest("[data-tid]");if(t){runPivot(t.dataset.tid,q,e);closeModal();return}
+  const r=ev.target.closest("[data-rid]");if(r)openDossier(+r.dataset.rid)}}
+
+/* =================== ПЕРЕСЕЧЕНИЯ КЕЙСОВ =================== */
+async function openIntersections(){const all=await api("intersections");
+ const b=modal("🔀 Пересечения кейсов",`<div class="hint" style="margin-bottom:10px">Одни и те же email, домены, IP, телефоны и аккаунты в разных расследованиях — возможная связь между делами.</div>
+  ${all.length?tbl(["Тип","Значение","Кейсы"],all.map(x=>[esc(TL[x.type]||x.type),esc(x.value),x.cases.map(c=>`<span class="tag ${cur&&c.id===cur.id?"good":""}" data-cid="${c.id}" style="cursor:pointer">${esc(c.name)}</span>`).join("")])):'<div class="empty" style="padding:30px"><b>Пересечений нет</b>Сущности не повторяются между кейсами</div>'}`);
+ b.onclick=e=>{const t=e.target.closest("[data-cid]");if(t){cur=cases.find(c=>c.id==t.dataset.cid);renderCases();refresh();closeModal()}}}
+
+/* =================== ОБХОД ССЫЛОК =================== */
+function openExpand(id){if(!cur)return;
+ const b=modal("🔗 Обойти ссылки страницы",`<div class="hint" style="margin-bottom:10px">Каждая найденная страница будет архивирована как отдельный источник (снимок, SHA-256, сущности) с пометкой, где её нашли.</div>
+  <div class="frow"><label>Глубина</label><select id="xd"><option value="1">1 — ссылки этой страницы</option><option value="2">2 — и ссылки на них</option></select></div>
+  <div class="frow"><label>Максимум страниц</label><input id="xl" type="number" min="1" max="80" value="20"></div>
+  ${chk("xs",true,"Только в пределах того же сайта")}
+  <div class="row" style="margin-top:12px"><button class="btn" id="xgo">Начать</button><button class="ghost" id="xstop">■ Стоп</button></div>
+  <div class="prog" style="margin-top:12px"><i id="xp"></i></div><div class="pmsg" id="xm"></div>`);
+ let jid=null;b.querySelector("#xstop").onclick=()=>jid&&api("job_cancel",{id:jid});
+ b.querySelector("#xgo").onclick=async ev=>{ev.target.classList.add("loading");
+  try{const r=await api("expand",{case:cur.id,id,depth:+b.querySelector("#xd").value,limit:+b.querySelector("#xl").value,same_host:b.querySelector("#xs").checked});jid=r.id;
+   const f=await waitJob(r.id,s=>{b.querySelector("#xp").style.width=(s.all?s.done/s.all*100:5)+"%";b.querySelector("#xm").textContent=(s.msg||"")+(s.all?` · ${s.done}/${s.all}`:"")});
+   ev.target.classList.remove("loading");
+   b.querySelector("#xm").textContent=f.state==="done"?`Готово: добавлено ${f.result.added}, ошибок ${f.result.failed}`:(f.error||f.state);refresh()}catch(x){toast(x.message,"bad")}}}
+
+/* =================== СЦЕНАРИИ =================== */
+async function openPlaybooks(){if(!cur)return toast("Сначала выберите кейс","bad");const pbs=await api("playbooks");let sel=pbs[0];
+ const b=modal("▶ Сценарий расследования",`<div class="hint" style="margin-bottom:10px">Сценарий запускает набор инструментов по одному значению и сохраняет каждый результат в кейс как доказательство.</div>
+  <div class="pbs">${pbs.map((p,i)=>`<div class="pb ${i?"":"on"}" data-i="${i}"><b>${esc(p.title)}</b><small>${p.archive?"архив страницы + ":""}${p.steps.map(s=>{const t=TOOLS.find(t=>t.id===s.split(":").pop());return t?t.tn:s}).join(" · ")}</small></div>`).join("")}</div>
+  <div class="row"><input id="pq" class="grow" placeholder="${esc(sel.ph)}"><button class="btn" id="pgo">Запустить</button><button class="ghost" id="pstop">■ Стоп</button></div>
+  <div class="prog" style="margin-top:12px"><i id="pp"></i></div><div class="pmsg" id="pm"></div><div id="pr"></div>`);
+ b.querySelector(".pbs").onclick=e=>{const c=e.target.closest(".pb");if(!c)return;b.querySelectorAll(".pb").forEach(x=>x.classList.toggle("on",x===c));sel=pbs[+c.dataset.i];b.querySelector("#pq").placeholder=sel.ph};
+ let jid=null;b.querySelector("#pstop").onclick=()=>jid&&api("job_cancel",{id:jid});
+ b.querySelector("#pgo").onclick=async ev=>{const q=b.querySelector("#pq").value.trim();if(!q)return toast("Введите значение","bad");ev.target.classList.add("loading");
+  try{const r=await api("playbook",{case:cur.id,id:sel.id,q});jid=r.id;
+   const f=await waitJob(r.id,s=>{b.querySelector("#pp").style.width=(s.all?s.done/s.all*100:5)+"%";b.querySelector("#pm").textContent=(s.msg||"")+(s.all?` · ${s.done}/${s.all}`:"")});
+   ev.target.classList.remove("loading");
+   if(f.state==="done"){b.querySelector("#pm").textContent=`Готово: успешно ${f.result.ok}, с ошибкой ${f.result.failed}`;
+    b.querySelector("#pr").innerHTML=tbl(["Инструмент","Значение","Итог"],f.result.steps.map(x=>{const t=TOOLS.find(t=>t.id===x.tool);return[esc(t?t.tn:x.tool==="archive"?"Архив страницы":x.tool),esc(x.q),x.state==="done"?`<span class="found">✓ #${x.source}${x.entities!=null?" · сущн. "+x.entities:""}</span>`:`<span style="color:var(--bad)">${esc(x.error||"ошибка")}</span>`]}));refresh()}
+   else b.querySelector("#pm").textContent=f.error||f.state}catch(x){toast(x.message,"bad")}}}
+
+/* =================== ИИ-СВОДКА =================== */
+function md(t){const L=esc(t).split("\n");let h="",inT=false,inL=false;
+ const il=s=>s.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/`([^`]+)`/g,"<code>$1</code>");
+ for(const raw of L){const l=raw.trim();
+  if(/^\|/.test(l)){if(/^\|[\s:|-]+\|$/.test(l))continue;const cells=l.replace(/^\||\|$/g,"").split("|").map(c=>il(c.trim()));
+   if(!inT){h+="<table><tr>"+cells.map(c=>`<th>${c}</th>`).join("")+"</tr>";inT=true}else h+="<tr>"+cells.map(c=>`<td>${c}</td>`).join("")+"</tr>";continue}
+  if(inT){h+="</table>";inT=false}
+  if(/^[-*] /.test(l)||/^\d+\. /.test(l)){if(!inL){h+="<ul>";inL=true}h+="<li>"+il(l.replace(/^([-*]|\d+\.) /,""))+"</li>";continue}
+  if(inL){h+="</ul>";inL=false}
+  const m=l.match(/^(#{1,4}) (.*)/);if(m){h+=`<h3>${il(m[2])}</h3>`;continue}
+  if(l)h+=`<p>${il(l)}</p>`}
+ return h+(inT?"</table>":"")+(inL?"</ul>":"")}
+async function openAi(){if(!cur)return toast("Сначала выберите кейс","bad");const s=await api("settings");
+ const b=modal("✨ ИИ-сводка кейса",`<div class="hint" style="margin-bottom:10px">Claude прочитает источники, сущности, хронологию и пересечения кейса и составит сводку: главное, ключевые сущности, связи, слабые места и следующие шаги.
+  <br><b style="color:var(--warn)">Данные кейса будут отправлены в Anthropic API</b> (модель ${esc(s.ai_model||"claude-opus-5-5")}). ${s.keys.anthropic?"Ключ задан.":"⚠ Ключ не задан — добавьте его в ⚙ Настройках."}</div>
+  <div class="row"><button class="btn" id="ago" ${s.keys.anthropic?"":"disabled"}>Составить сводку</button><button class="ghost" id="asave" hidden>＋ В кейс</button><button class="ghost" id="acopy" hidden>⧉ Копировать</button></div>
+  <div class="prog ind" id="ap" hidden style="margin-top:12px"><i></i></div><div class="pmsg" id="am"></div><div class="md" id="ares" style="margin-top:10px"></div>`);
+ let jid=null,text="";
+ b.querySelector("#ago").onclick=async ev=>{ev.target.classList.add("loading");b.querySelector("#ap").hidden=false;
+  try{const r=await api("ai_summary",{case:cur.id});jid=r.id;const f=await waitJob(r.id,x=>b.querySelector("#am").textContent=x.msg||"");
+   b.querySelector("#ap").hidden=true;ev.target.classList.remove("loading");
+   if(f.state!=="done"){b.querySelector("#am").innerHTML=`<span style="color:var(--bad)">${esc(f.error||f.state)}</span>`;return}
+   text=f.result.summary;b.querySelector("#ares").innerHTML=md(text);
+   b.querySelector("#am").textContent=`${f.result.model} · вход ${f.result.usage.input_tokens} ток. · выход ${f.result.usage.output_tokens} ток. · ${f.elapsed} с. ${f.result.note}`;
+   b.querySelector("#asave").hidden=b.querySelector("#acopy").hidden=false}catch(x){toast(x.message,"bad")}};
+ b.querySelector("#asave").onclick=async ev=>{try{const r=await api("job_save",{id:jid,case:cur.id});ev.target.outerHTML=`<span class="chip ok">✓ источник #${r.source}</span>`;refresh()}catch(x){toast(x.message,"bad")}};
+ b.querySelector("#acopy").onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(text);toast("Скопировано","ok")}}
+
+/* =================== МОНИТОРИНГ БРЕНДА =================== */
+async function openBrand(){if(!cur)return toast("Сначала выберите кейс","bad");const list=await api("brand?case="+cur.id);
+ const b=modal("🛡 Мониторинг бренда",`<div class="hint" style="margin-bottom:10px">Provenio периодически ищет новые зарегистрированные домены-двойники (опечатки, гомоглифы, другие зоны) и новые поддомены/сертификаты
+  в логах Certificate Transparency. Новые находки сохраняются в кейс и приходят уведомлением. Проверка идёт, пока Provenio открыт.</div>
+  <div class="row"><input id="bd" class="grow" placeholder="ваш-бренд.ru"><select id="bi" style="max-width:170px"><option value="360">каждые 6 часов</option><option value="720">каждые 12 часов</option><option value="1440" selected>раз в сутки</option><option value="10080">раз в неделю</option></select><button class="btn" id="bgo2">Следить</button></div>
+  <div class="prog" style="margin-top:12px"><i id="bp"></i></div><div class="pmsg" id="bm"></div>
+  <div style="margin-top:12px">${list.length?tbl(["Домен","Интервал","Последняя проверка","Изменений",""],list.map(m=>[esc(m.domain),Math.round(m.interval_min/60)+" ч",esc(m.last_check||"ещё нет"),m.changes,`<button class="ghost del" data-off="${esc(m.domain)}">Выключить</button>`])):'<span class="mu">Мониторинг ещё не настроен</span>'}</div>`);
+ b.onclick=async e=>{const o=e.target.closest("[data-off]");if(o){await api("brand",{case:cur.id,domain:o.dataset.off,interval:0});toast("Мониторинг выключен","ok");closeModal()}};
+ b.querySelector("#bgo2").onclick=async ev=>{const d=b.querySelector("#bd").value.trim();if(!d)return;ev.target.classList.add("loading");
+  try{const r=await api("brand",{case:cur.id,domain:d,interval:+b.querySelector("#bi").value});
+   const f=await waitJob(r.id,s=>{b.querySelector("#bp").style.width=(s.all?s.done/s.all*100:5)+"%";b.querySelector("#bm").textContent=s.msg||""});
+   ev.target.classList.remove("loading");
+   b.querySelector("#bm").textContent=f.state==="done"?`Исходное состояние сохранено: двойников ${f.result.lookalikes}, поддоменов ${f.result.subdomains}. Дальше — только новые.`:(f.error||f.state);refresh()}catch(x){toast(x.message,"bad")}}}
+
+/* =================== ЭКСПОРТ ГРАФА PNG =================== */
+async function exportPng(){if(tab!=="graph"){setTab("graph");await new Promise(r=>setTimeout(r,900))}
+ const c=document.createElement("canvas");c.width=cv.width;c.height=cv.height;const x=c.getContext("2d");
+ x.fillStyle="#08060f";x.fillRect(0,0,c.width,c.height);x.drawImage(cv,0,0);
+ x.fillStyle="#9b93b5";x.font=(12*dpr)+"px Segoe UI";x.fillText(`Provenio · ${cur?cur.name:""} · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC`,14*dpr,22*dpr);
+ const r=await api("blob",{data:c.toDataURL("image/png"),ctype:"image/png",name:`provenio_graph_${(cur&&cur.name||"case").replace(/[^\w-]+/g,"_")}.png`});
+ const a=document.createElement("a");a.href=`/download/blob?id=${r.id}&t=${T}`;a.download="";document.body.append(a);a.click();a.remove()}
+
+/* =================== IP-РАДАР =================== */
+function vcol(r){const v=r.verdict;return r.confidence>=70||v.startsWith("C2")?"#fb7185":r.confidence>=35?"#fbbf24":/Tor|прокси/.test(v)?"#e879f9":/инфраструктура/.test(v)?"#60a5fa":"#34d399"}
+function radarView(d,compact){return `<div class="${compact?"":"rgrid"}">`+d.results.map((r,i)=>{const c=vcol(r);return `<div class="card rcard" style="--c:${c};--i:${i};animation-delay:${Math.min(i,12)*50}ms">
+ <div class="row"><div class="ring" style="--p:${r.confidence};--c:${c}"><b>${r.confidence}</b></div>
+ <div class="grow"><div class="rip">${esc(r.ip)}</div><div class="rv" style="color:${c}">${esc(r.verdict)}</div>
+ <div class="pmsg">${esc([r.geo.city,r.geo.country].filter(Boolean).join(", ")||"—")} · ${esc(r.network.as||"")}</div></div></div>
+ <div>${r.tags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}${r.infrastructure.map(t=>`<span class="tag good">${esc(t)}</span>`).join("")}</div>
+ ${r.evidence.length?tbl(["Источник","Категория","Детали"],r.evidence.map(e=>[esc(e.source),esc(e.category),esc(e.detail)])):'<div class="pmsg">Ни один источник не отметил этот адрес</div>'}
+ ${kv("Провайдер",r.network.isp||r.network.org)}${r.network.ptr?kv("PTR",r.network.ptr):""}${r.ports.length?kv("Открытые порты",r.ports.join(", ")):""}
+ ${r.vulns.length?`<div class="kv"><b>CVE</b><span>${r.vulns.map(v=>`<span class="tag miss">${esc(v)}</span>`).join("")}</span></div>`:""}${r.hostnames.length?kv("Хосты",r.hostnames.join(", ")):""}
+ ${r.geo.lat!=null&&!compact?`<div><button class="ghost" data-go="${r.geo.lon},${r.geo.lat}" data-lbl="${esc(r.ip)}">🌍 На глобусе</button></div>`:""}</div>`}).join("")+`</div>`+
+ `<details class="pmsg" style="margin-top:12px"><summary>Открытые списки (${d.feeds.length})</summary>${d.feeds.map(f=>`${esc(f.name)}: ${f.records} записей${f.age_h!=null?", обновлён "+f.age_h+" ч назад":""}${f.error?" · ошибка "+esc(f.error):""}`).join("<br>")}</details><div class="pmsg">${esc(d.note)}</div>`}
+const RADAR={job:null};
+$("#rgo").onclick=async()=>{const q=$("#rq").value.trim();if(!q)return toast("Введите IP","bad");$("#rgo").classList.add("loading");$("#rprog").hidden=false;$("#rstop").hidden=false;$("#rsave").hidden=true;
+ try{const r=await api("job",{name:"ip_radar",q});RADAR.job=r.id;
+  const f=await waitJob(r.id,s=>{$("#rprog i").style.width=(s.all?s.done/s.all*100:5)+"%";$("#rmsg").textContent=s.msg||""});
+  if(f.state==="done"){$("#rres").innerHTML=radarView(f.result);$("#rmsg").textContent=`Проверено ${f.result.count} IP за ${f.elapsed} с`;$("#rsave").hidden=false}
+  else $("#rmsg").textContent=f.error||f.state}catch(x){toast(x.message,"bad")}
+ $("#rgo").classList.remove("loading");$("#rprog").hidden=true;$("#rstop").hidden=true};
+$("#rq").onkeydown=e=>{if(e.key==="Enter"&&e.ctrlKey)$("#rgo").click()};
+$("#rstop").onclick=()=>RADAR.job&&api("job_cancel",{id:RADAR.job});
+$("#rcase").onclick=()=>{if(!st)return;const ips=st.entities.filter(e=>e.type==="ip").map(e=>e.value);if(!ips.length)return toast("В кейсе нет IP-адресов","bad");$("#rq").value=ips.slice(0,50).join("\n")};
+$("#rsave").onclick=async()=>{if(!cur)return toast("Сначала создайте кейс","bad");try{const r=await api("job_save",{id:RADAR.job,case:cur.id});$("#rsave").hidden=true;toast("Сохранено в кейс: источник #"+r.source+", сущностей "+r.entities,"ok");refresh()}catch(x){toast(x.message,"bad")}};
+$("#rres").onclick=e=>{const g=e.target.closest("[data-go]");if(g){const[lon,lat]=g.dataset.go.split(",").map(Number);globeGo(lon,lat,g.dataset.lbl)}};
+
+/* =================== УТЕЧКИ =================== */
+function leaksView(d){
+ if(d.kind==="password")return `<div class="lhead"><div class="big" style="color:${d.exposed?"var(--bad)":"var(--ok)"}">${d.exposed?d.count.toLocaleString("ru"):"✓"}</div>
+  <div><b style="color:${d.exposed?"var(--bad)":"var(--ok)"}">${d.exposed?"Пароль найден в утечках — раз":"Пароль не найден в известных утечках"}</b><div class="pmsg">${esc(d.note)}</div></div></div>
+  ${d.composition?kv("Состав",Object.entries(d.composition).map(([k,v])=>k+": "+v).join(" · ")):""}${kv("Отправлено в API",d.hash_prefix_sent+"…")}`;
+ const risk=d.risk&&d.risk.label?`<span class="pill" style="color:${/high|critical/i.test(d.risk.label)?"var(--bad)":/medium/i.test(d.risk.label)?"var(--warn)":"var(--ok)"}">риск: ${esc(d.risk.label)} ${d.risk.score??""}</span>`:"";
+ return `<div class="lhead"><div class="big" style="color:${d.exposed?"var(--bad)":"var(--ok)"}">${d.exposed?d.breaches_count:"✓"}</div>
+  <div><b>${d.exposed?(d.kind==="email"?"утечек с этим адресом":"известных утечек сервиса"):"В известных утечках не найдено"}</b> <span class="mu">${esc(d.query||"")}</span>
+  <div class="row" style="margin-top:6px">${risk}${d.password_strength?`<span class="pill">пароли: ${esc(JSON.stringify(d.password_strength).replace(/[{}"\[\]]/g," ").slice(0,90))}</span>`:""}</div></div></div>
+  ${(d.data_types||[]).length?sec("Какие данные раскрыты",d.data_types.map(t=>`<span class="tag miss">${esc(t.type)} ×${t.breaches}</span>`).join("")):""}
+  <div class="lgrid">${(d.breaches||[]).map((x,i)=>`<div class="card lcard" style="animation-delay:${Math.min(i,20)*30}ms"><div class="row">${x.logo?`<img src="${esc(x.logo)}" alt="" onerror="this.remove()">`:""}<div class="grow"><b>${esc(x.name)}</b><div class="pmsg">${esc(x.domain||"")} · ${esc((x.date||"").slice(0,10))}</div></div>
+   ${x.password_risk?`<span class="sev ${/plain|easy/.test(x.password_risk)?"c":"m"}">${esc(x.password_risk)}</span>`:""}</div>
+   ${x.records?`<div class="pmsg">записей: ${Number(x.records).toLocaleString("ru")}${x.industry?" · "+esc(x.industry):""}</div>`:""}
+   ${x.data?`<div>${String(x.data).split(";").filter(Boolean).slice(0,10).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>`:""}
+   ${x.details?`<div class="pmsg">${esc(x.details)}</div>`:""}</div>`).join("")}</div><div class="pmsg" style="margin-top:10px">${esc(d.note||"")} · Источник: ${esc(d.source||"XposedOrNot")}</div>`}
+let lmode="email",LJOB=null;
+$("#lmode").onclick=e=>{const c=e.target.closest(".fc");if(!c)return;lmode=c.dataset.m;$$("#lmode .fc").forEach(x=>x.classList.toggle("on",x===c));
+ $("#lq").type=lmode==="password"?"password":"text";$("#lq").placeholder={email:"user@example.com",domain:"example.com",password:"пароль для проверки"}[lmode];$("#lq").value=""};
+$("#lgo").onclick=async()=>{const q=$("#lq").value.trim();if(!q)return;
+ if(lmode==="email"&&!q.includes("@"))return toast("Введите email","bad");if(lmode==="domain"&&(q.includes("@")||!q.includes(".")))return toast("Введите домен","bad");
+ $("#lgo").classList.add("loading");$("#lsave").hidden=true;
+ try{const r=await api("job",{name:"leaks",q:lmode==="password"&&/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(q)?q+" ":q});LJOB=r.id;const f=await waitJob(r.id,s=>$("#lmsg").textContent=s.msg||"");
+  if(f.state==="done"){$("#lres").innerHTML=leaksView(f.result);$("#lmsg").textContent=`Готово за ${f.elapsed} с`;if(lmode!=="password")$("#lsave").hidden=false}
+  else{$("#lres").innerHTML=`<div class="card" style="color:var(--bad)">⚠ ${esc(f.error||f.state)}</div>`;$("#lmsg").textContent=""}}catch(x){toast(x.message,"bad")}
+ $("#lgo").classList.remove("loading")};
+$("#lq").onkeydown=e=>{if(e.key==="Enter")$("#lgo").click()};
+$("#lsave").onclick=async()=>{if(!cur)return toast("Сначала создайте кейс","bad");try{const r=await api("job_save",{id:LJOB,case:cur.id});$("#lsave").hidden=true;toast("Сохранено в кейс: источник #"+r.source,"ok");refresh()}catch(x){toast(x.message,"bad")}};
+
+/* =================== ФИШИНГ =================== */
+function phishView(d){const c=d.risk_score>=60?"var(--bad)":d.risk_score>=30?"var(--warn)":"var(--ok)";
+ return `<div class="row" style="margin-bottom:10px"><div class="ring" style="--p:${d.risk_score};--c:${c}"><b>${d.risk_score}</b></div><div class="grow"><b style="color:${c};font-size:15px;text-transform:uppercase">${esc(d.verdict)}</b>
+  <div class="pmsg">${esc(d.host)}${d.final_url!==d.url?" · итоговый адрес: "+esc(d.final_url):""}</div></div></div>
+  ${d.signals.map(s=>`<div class="kv"><b style="min-width:44px;color:${s.weight<0?"var(--ok)":s.level==="bad"?"var(--bad)":"var(--warn)"}">${s.weight>0?"+":""}${s.weight}</b><span>${esc(s.text)}</span></div>`).join("")||'<div class="pmsg">Подозрительных признаков нет</div>'}
+  ${kv("Домен создан",d.domain_created?(d.domain_created.slice(0,10)+(d.domain_age_days!=null?` (${d.domain_age_days} дн.)`:"")):"неизвестно")}
+  ${d.certificate?kv("Сертификат",(d.certificate.issuer||"")+" · с "+(d.certificate.valid_from||"")):""}
+  ${d.page&&d.page.title?kv("Заголовок страницы",d.page.title):""}${d.reputation?kv("Репутация",d.reputation.risk_score+"/100 · "+d.reputation.verdict):""}
+  <div class="pmsg">${esc(d.note)}</div>`}
+
+/* =================== ОБНОВЛЕНИЯ =================== */
+async function checkUpdates(){try{const s=await api("settings");if(!s.check_updates)return;const u=await api("update_check");
+ if(u&&u.newer){const a=$("#updb");a.hidden=false;a.href=u.url;a.textContent="⬆ Доступна версия "+u.latest;toast("Вышла Provenio "+u.latest+" — ссылка слева внизу","ok")}}catch(x){}}
+
+/* =================== ГЛОБУС =================== */
+const RAD=Math.PI/180,MU=398600.4418,RE=6378.137,J2=1.08263e-3;
+const GV={lon:40,lat:35,zoom:1,auto:true,night:true,drag:null,sel:null,track:false,hits:[],land:null,borders:null,inited:false,mark:null,last:performance.now(),
+ L:{flights:{on:true,items:[],t:0},sats:{on:true,group:"stations",items:[]},quakes:{on:true,items:[]},events:{on:false,items:[]},cas:{on:true,items:[]}}};
+const gc=$("#gcv"),gx=gc.getContext("2d");let GW=0,GH=0;
+function gSize(){GW=gc.clientWidth;GH=gc.clientHeight;gc.width=GW*dpr;gc.height=GH*dpr}
+window.addEventListener("resize",()=>{if(tab==="globe")gSize()});
+function gR(){return Math.min(GW,GH)*.43*GV.zoom}
+function proj(lon,lat,r){r=r||1;const l=(lon-GV.lon)*RAD,p=lat*RAD,p0=GV.lat*RAD,cp=Math.cos(p),cl=Math.cos(l);
+ const x=r*cp*Math.sin(l),y=r*(Math.cos(p0)*Math.sin(p)-Math.sin(p0)*cp*cl),z=r*(Math.sin(p0)*Math.sin(p)+Math.cos(p0)*cp*cl),R=gR();
+ return{x:GW/2+x*R,y:GH/2-y*R,z,ux:x,uy:y,vis:z>0||x*x+y*y>1}}
+function unproj(sx,sy){const R=gR(),x=(sx-GW/2)/R,y=-(sy-GH/2)/R,r2=x*x+y*y;if(r2>1)return null;const z=Math.sqrt(1-r2),p0=GV.lat*RAD;
+ const lat=Math.asin(y*Math.cos(p0)+z*Math.sin(p0)),lon=GV.lon+Math.atan2(x,z*Math.cos(p0)-y*Math.sin(p0))/RAD;return{lat:lat/RAD,lon:((lon+540)%360)-180}}
+function topo(t){const sc=t.transform.scale,tr=t.transform.translate;
+ const arcs=t.arcs.map(a=>{let x=0,y=0;return a.map(p=>{x+=p[0];y+=p[1];return[x*sc[0]+tr[0],y*sc[1]+tr[1]]})});
+ const arc=i=>i<0?arcs[~i].slice().reverse():arcs[i];
+ const ring=r=>{let o=[];r.forEach((i,k)=>{const a=arc(i);o=o.concat(k?a.slice(1):a)});return o};
+ const polys=g=>g.type==="Polygon"?[g.arcs.map(ring)]:g.type==="MultiPolygon"?g.arcs.map(p=>p.map(ring)):[];
+ const land=[],brd=[];t.objects.land.geometries.forEach(g=>polys(g).forEach(p=>p.forEach(r=>land.push(r))));
+ t.objects.countries.geometries.forEach(g=>polys(g).forEach(p=>p.forEach(r=>brd.push({r,n:(g.properties||{}).name}))));return{land,brd}}
+function satPos(o,t){if(!o._p){const n=o.MEAN_MOTION*2*Math.PI/86400,a=Math.cbrt(MU/(n*n)),e=o.ECCENTRICITY,i=o.INCLINATION*RAD,pp=a*(1-e*e),f=1.5*n*J2*(RE/pp)**2;
+  o._p={n,a,e,i,O:o.RA_OF_ASC_NODE*RAD,w:o.ARG_OF_PERICENTER*RAD,M:o.MEAN_ANOMALY*RAD,ep:Date.parse(o.EPOCH+"Z"),dO:-f*Math.cos(i),dw:f*(2-2.5*Math.sin(i)**2)}}
+ const q=o._p,dt=(t-q.ep)/1000,M=q.M+q.n*dt,O=q.O+q.dO*dt,w=q.w+q.dw*dt;let E=M;for(let k=0;k<6;k++)E-=(E-q.e*Math.sin(E)-M)/(1-q.e*Math.cos(E));
+ const nu=2*Math.atan2(Math.sqrt(1+q.e)*Math.sin(E/2),Math.sqrt(1-q.e)*Math.cos(E/2)),r=q.a*(1-q.e*Math.cos(E)),u=w+nu,ci=Math.cos(q.i),si=Math.sin(q.i);
+ const x=r*(Math.cos(O)*Math.cos(u)-Math.sin(O)*Math.sin(u)*ci),y=r*(Math.sin(O)*Math.cos(u)+Math.cos(O)*Math.sin(u)*ci),z=r*Math.sin(u)*si;
+ const jd=t/864e5+2440587.5,g=((280.46061837+360.98564736629*(jd-2451545))%360)*RAD,lon=(Math.atan2(y,x)-g)/RAD;
+ return{lon:((lon%360)+540)%360-180,lat:Math.atan2(z,Math.hypot(x,y))/RAD,alt:r-RE,v:Math.sqrt(MU*(2/r-1/q.a)),period:2*Math.PI/q.n/60}}
+let LM=null;const lc=document.createElement("canvas"),lctx=lc.getContext("2d");
+function buildMask(){const w=2048,h=1024,c=document.createElement("canvas");c.width=w;c.height=h;const x=c.getContext("2d");x.fillStyle="#fff";x.beginPath();
+ for(const r of GV.land){r.forEach(([lo,la],i)=>{const X=(lo+180)/360*w,Y=(90-la)/180*h;i?x.lineTo(X,Y):x.moveTo(X,Y)});x.closePath()}x.fill("evenodd");x.fillRect(0,(90+85.5)/180*h,w,h);
+ const d=x.getImageData(0,0,w,h).data,m=new Uint8Array(w*h);for(let i=0;i<w*h;i++)m[i]=d[i*4]>127?1:0;LM={w,h,m}}
+function drawSphere(now){const R=gR(),cx=GW/2,cy=GH/2,step=R>700?3:2;
+ const x0=Math.max(0,Math.floor(cx-R)),x1=Math.min(GW,Math.ceil(cx+R)),y0=Math.max(0,Math.floor(cy-R)),y1=Math.min(GH,Math.ceil(cy+R));
+ const w=Math.ceil((x1-x0)/step),h=Math.ceil((y1-y0)/step);if(w<=0||h<=0)return;
+ if(lc.width<w||lc.height<h){lc.width=Math.max(w,lc.width);lc.height=Math.max(h,lc.height)}
+ const id=lctx.createImageData(w,h),d=id.data,p0=GV.lat*RAD,sp=Math.sin(p0),cp=Math.cos(p0),l0=GV.lon*RAD;
+ const sun=sunPos(now),sd=sun.lat*RAD,ssd=Math.sin(sd),csd=Math.cos(sd),sl=sun.lon*RAD,night=GV.night,M=LM;
+ for(let j=0;j<h;j++){const yy=-(y0+j*step-cy)/R;for(let i=0;i<w;i++){const xx=(x0+i*step-cx)/R,r2=xx*xx+yy*yy;if(r2>1)continue;
+  const z=Math.sqrt(1-r2),sl_=yy*cp+z*sp,lat=Math.asin(sl_),lon=l0+Math.atan2(xx,z*cp-yy*sp);
+  let land=0;if(M){let u=((lon/RAD+180)%360+360)%360/360*M.w|0,v=(90-lat/RAD)/180*M.h|0;if(v>=M.h)v=M.h-1;land=M.m[v*M.w+u]}
+  let day=1;if(night){const cz=sl_*ssd+Math.cos(lat)*csd*Math.cos(lon-sl);day=cz>.12?1:cz<-.12?0:(cz+.12)/.24}
+  const sh=.55+.45*z,k=(j*w+i)*4;
+  if(land){d[k]=(34+86*day)*sh;d[k+1]=(18+44*day)*sh;d[k+2]=(66+130*day)*sh}else{d[k]=(8+16*day)*sh;d[k+1]=(6+10*day)*sh;d[k+2]=(18+36*day)*sh}
+  d[k+3]=255}}
+ lctx.putImageData(id,0,0);gx.imageSmoothingEnabled=true;gx.drawImage(lc,0,0,w,h,x0,y0,w*step,h*step)}
+function sunPos(t){const d=new Date(t),doy=(t-Date.UTC(d.getUTCFullYear(),0,0))/864e5,decl=-23.44*Math.cos(2*Math.PI/365*(doy+10)),
+ h=d.getUTCHours()+d.getUTCMinutes()/60+d.getUTCSeconds()/3600;return{lat:decl,lon:((-(h-12)*15)+540)%360-180}}
+async function gLoad(layer){const L=GV.L[layer];try{
+ if(layer==="flights"){const r=await api("globe?layer=flights");L.items=r.items;L.t=performance.now();L.src=r.source+(r.note?" · "+r.note:"")}
+ if(layer==="sats"){const r=await api("globe?layer=sats&group="+L.group);L.items=r.items}
+ if(layer==="quakes"){const r=await api("globe?layer=quakes");L.items=r.items}
+ if(layer==="events"){const r=await api("globe?layer=events");L.items=r.items}
+ if(layer==="cas"){L.items=cur?(await api("globe?layer=case&case="+cur.id)).items:[]}
+ $("#gn-"+layer).textContent=L.items.length}catch(x){$("#gn-"+layer).textContent="ошибка";$("#gstat").textContent=layer+": "+x.message}}
+async function globeOpen(){gSize();if(GV.inited)return;GV.inited=true;
+ try{const r=await fetch("/static/world.json",{headers:{"X-Token":T}});const w=topo(await r.json());GV.land=w.land;GV.borders=w.brd;buildMask()}catch(x){$("#gstat").textContent="Карта не загрузилась"}
+ api("globe?layer=groups").then(g=>{$("#ggroup").innerHTML=Object.entries(g).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")});
+ for(const l of Object.keys(GV.L))if(GV.L[l].on)gLoad(l);
+ setInterval(()=>{if(tab==="globe"&&GV.L.flights.on)gLoad("flights")},30000);requestAnimationFrame(gTick)}
+$$("#p-globe [data-l]").forEach(c=>c.onchange=()=>{const L=GV.L[c.dataset.l];L.on=c.checked;if(L.on&&!L.items.length)gLoad(c.dataset.l)});
+$("#ggroup").onchange=e=>{GV.L.sats.group=e.target.value;GV.L.sats.items=[];gLoad("sats")};
+$("#gauto").onchange=e=>GV.auto=e.target.checked;$("#gnight").onchange=e=>GV.night=e.target.checked;
+$("#gq").onkeydown=async e=>{if(e.key!=="Enter")return;try{const r=await api("globe?layer=geocode&q="+encodeURIComponent(e.target.value));
+ $("#gres").innerHTML=r.map((x,i)=>`<div data-i="${i}">${esc(x.name)}</div>`).join("")||'<div>Ничего не найдено</div>';
+ $("#gres").onclick=ev=>{const d=ev.target.closest("[data-i]");if(d){const x=r[+d.dataset.i];globeGo(x.lon,x.lat,x.name.split(",")[0]);$("#gres").innerHTML=""}}}catch(x){toast(x.message,"bad")}};
+function globeGo(lon,lat,label){setTab("globe");GV.auto=false;$("#gauto").checked=false;GV.fly={lon,lat};GV.mark={lon,lat,label};GV.zoom=Math.max(GV.zoom,2.2)}
+async function globeFindIp(ip){const L=GV.L.cas;if(!L.items.length)await gLoad("cas");const p=L.items.find(x=>x.label===ip);if(p){globeGo(p.lon,p.lat,ip);gSelect("cas",p)}else toast("Нет координат для "+ip,"bad")}
+let gDown=null;
+gc.onmousedown=e=>{gDown={x:e.clientX,y:e.clientY,lon:GV.lon,lat:GV.lat,moved:false};gc.style.cursor="grabbing"};
+window.addEventListener("mousemove",e=>{const r=gc.getBoundingClientRect();if(tab==="globe"){const u=unproj(e.clientX-r.left,e.clientY-r.top);$("#gcoord").textContent=u?`${u.lat.toFixed(3)}°, ${u.lon.toFixed(3)}°`:""}
+ if(!gDown)return;const dx=e.clientX-gDown.x,dy=e.clientY-gDown.y;if(Math.abs(dx)+Math.abs(dy)>3)gDown.moved=true;
+ const k=90/gR();GV.lon=gDown.lon-dx*k;GV.lat=Math.max(-85,Math.min(85,gDown.lat+dy*k));GV.fly=null;GV.track=false});
+window.addEventListener("mouseup",e=>{if(!gDown)return;const m=gDown.moved;gDown=null;gc.style.cursor="grab";if(m)return;
+ const r=gc.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;let best=null,bd=10;
+ for(const h of GV.hits){const d=Math.hypot(h.x-x,h.y-y);if(d<bd){bd=d;best=h}}if(best)gSelect(best.l,best.o);else{GV.sel=null;$("#ginfo").classList.remove("show")}});
+gc.addEventListener("wheel",e=>{e.preventDefault();GV.zoom=Math.max(.6,Math.min(30,GV.zoom*(e.deltaY<0?1.15:1/1.15)))},{passive:false});
+function gSelect(l,o){GV.sel={l,o};GV.track=false;const el=$("#ginfo");el.classList.add("show");const now=Date.now();let h="";
+ if(l==="flights")h=`<h4>✈ ${esc(o.cs||o.id)}<button class="x">✕</button></h4>${kv("ICAO24",o.id)}${kv("Страна регистрации",o.co)}${kv("Высота",o.alt+" м")}${kv("Скорость",o.v+" км/ч")}${kv("Курс",o.hd+"°")}${o.sq?kv("Squawk",o.sq):""}
+  <div class="tacts"><a class="ghost" target="_blank" href="https://globe.adsbexchange.com/?icao=${esc(o.id)}">ADS-B Exchange ↗</a><a class="ghost" target="_blank" href="https://www.flightradar24.com/${esc(o.cs||"")}">Flightradar24 ↗</a></div>`;
+ if(l==="sats"){const p=satPos(o,now);h=`<h4>🛰 ${esc(o.OBJECT_NAME)}<button class="x">✕</button></h4>${kv("NORAD",o.NORAD_CAT_ID)}${kv("COSPAR",o.OBJECT_ID)}${kv("Высота",Math.round(p.alt)+" км")}${kv("Скорость",p.v.toFixed(2)+" км/с")}${kv("Период",p.period.toFixed(1)+" мин")}${kv("Наклонение",o.INCLINATION+"°")}${kv("Эпоха TLE",o.EPOCH)}
+  <div class="tacts"><a class="ghost" target="_blank" href="https://www.n2yo.com/satellite/?s=${o.NORAD_CAT_ID}">N2YO ↗</a></div><div class="pmsg">Положение рассчитано по орбитальным элементам (Кеплер + J2), точность — километры.</div>`}
+ if(l==="quakes")h=`<h4>〰 M${o.mag}<button class="x">✕</button></h4>${kv("Место",o.place)}${kv("Время",new Date(o.time).toISOString().replace("T"," ").slice(0,19)+" UTC")}${kv("Глубина",o.depth+" км")}${o.tsunami?kv("Цунами","возможна угроза"):""}<div class="tacts"><a class="ghost" target="_blank" href="${esc(o.url)}">USGS ↗</a></div>`;
+ if(l==="events")h=`<h4>🔥 ${esc(o.title)}<button class="x">✕</button></h4>${kv("Категория",o.cat)}${kv("Дата",o.date)}${o.url?`<div class="tacts"><a class="ghost" target="_blank" href="${esc(o.url)}">Источник ↗</a></div>`:""}`;
+ if(l==="cas")h=`<h4>◆ ${esc(o.label)}<button class="x">✕</button></h4>${kv("Тип",o.kind==="ip"?"IP-адрес кейса":"GPS из фото")}${kv("Где",o.info)}${o.conf!=null?kv("Достоверность",o.conf+"%"):""}${o.entity?`<div class="tacts"><button class="ghost" data-dos="${o.entity}">🗂 Досье</button></div>`:""}`;
+ const pos=gPos(l,o,now);h+=kv("Координаты",pos?pos.lat.toFixed(4)+", "+pos.lon.toFixed(4):"—");
+ h+=`<div class="tacts"><button class="ghost" data-gtrack>🎯 Следить</button>${l!=="cas"?`<button class="ghost" data-gsave>＋ В кейс</button>`:""}<a class="ghost" target="_blank" href="https://www.openstreetmap.org/?mlat=${pos?pos.lat:0}&mlon=${pos?pos.lon:0}#map=9/${pos?pos.lat:0}/${pos?pos.lon:0}">Карта ↗</a></div>`;
+ el.innerHTML=h}
+$("#ginfo").onclick=async e=>{if(e.target.classList.contains("x")){GV.sel=null;$("#ginfo").classList.remove("show");return}
+ if(e.target.closest("[data-gtrack]")){GV.track=true;GV.auto=false;$("#gauto").checked=false;GV.zoom=Math.max(GV.zoom,2);return}
+ const d=e.target.closest("[data-dos]");if(d){openDossier(+d.dataset.dos);return}
+ if(e.target.closest("[data-gsave]")&&GV.sel){if(!cur)return toast("Сначала создайте кейс","bad");const{l,o}=GV.sel,pos=gPos(l,o,Date.now());
+  const obj={...o};delete obj._p;delete obj.dlat;delete obj.dlon;obj.position_at_save=pos;
+  const label=l==="flights"?"рейс "+(o.cs||o.id):l==="sats"?"спутник "+o.OBJECT_NAME:l==="quakes"?"землетрясение M"+o.mag+" "+o.place:o.title;
+  try{const r=await api("globe_save",{case:cur.id,layer:l,label,obj});toast("Сохранено в кейс: источник #"+r.source,"ok");refresh()}catch(x){toast(x.message,"bad")}}};
+function gPos(l,o,now){if(l==="sats")return satPos(o,now);if(l==="flights"){const dt=(performance.now()-GV.L.flights.t)/3600000,dist=o.v*dt,h=o.hd*RAD;
+  return{lat:o.lat+dist*Math.cos(h)/111.32,lon:o.lon+dist*Math.sin(h)/(111.32*Math.max(.1,Math.cos(o.lat*RAD)))}}return{lat:o.lat,lon:o.lon}}
+function gPath(ring,clamp){let first=true;for(const[lon,lat]of ring){const p=proj(lon,lat);let x=p.x,y=p.y;
+ if(p.z<0){if(!clamp){first=true;continue}const n=Math.hypot(p.ux,p.uy)||1,R=gR();x=GW/2+p.ux/n*R;y=GH/2-p.uy/n*R}
+ if(first){gx.moveTo(x,y);first=false}else gx.lineTo(x,y)}}
+function gTick(t){requestAnimationFrame(gTick);if(tab!=="globe"||!GW)return;const dt=Math.min(100,t-GV.last);GV.last=t;const now=Date.now();
+ if(GV.auto&&!gDown&&!GV.sel)GV.lon+=dt*.004;
+ if(GV.fly){GV.lon+=(((GV.fly.lon-GV.lon+540)%360)-180)*.08;GV.lat+=(GV.fly.lat-GV.lat)*.08;if(Math.abs(GV.fly.lat-GV.lat)<.05)GV.fly=null}
+ if(GV.track&&GV.sel){const p=gPos(GV.sel.l,GV.sel.o,now);if(p){GV.lon+=(((p.lon-GV.lon+540)%360)-180)*.1;GV.lat+=(p.lat-GV.lat)*.1}}
+ const R=gR(),cx=GW/2,cy=GH/2;gx.setTransform(dpr,0,0,dpr,0,0);gx.clearRect(0,0,GW,GH);GV.hits=[];
+ const atm=gx.createRadialGradient(cx,cy,R*.95,cx,cy,R*1.25);atm.addColorStop(0,"rgba(139,92,246,.35)");atm.addColorStop(1,"rgba(139,92,246,0)");gx.fillStyle=atm;gx.beginPath();gx.arc(cx,cy,R*1.25,0,7);gx.fill();
+ drawSphere(now);
+ gx.save();gx.beginPath();gx.arc(cx,cy,R,0,7);gx.clip();
+ gx.strokeStyle="rgba(168,130,255,.09)";gx.lineWidth=1;
+ for(let lo=-180;lo<180;lo+=30){gx.beginPath();const ring=[];for(let la=-90;la<=90;la+=3)ring.push([lo,la]);gPath(ring,false);gx.stroke()}
+ for(let la=-60;la<=60;la+=30){gx.beginPath();const ring=[];for(let lo=-180;lo<=180;lo+=3)ring.push([lo,la]);gPath(ring,false);gx.stroke()}
+ if(GV.land){gx.strokeStyle="rgba(192,132,252,.35)";gx.lineWidth=.7;gx.beginPath();for(const b of GV.borders)gPath(b.r,false);gx.stroke()}
+ if(GV.night){const s=sunPos(now),sp=proj(s.lon,s.lat);if(sp.z>0){gx.fillStyle="#fde68a";gx.shadowColor="#fde68a";gx.shadowBlur=18;gx.beginPath();gx.arc(sp.x,sp.y,4,0,7);gx.fill();gx.shadowBlur=0}}
+ gx.restore();
+ const L=GV.L,sel=GV.sel;
+ if(L.events.on)for(const o of L.events.items){const p=proj(o.lon,o.lat);if(p.z<=0)continue;gx.font="13px Segoe UI Emoji";gx.textAlign="center";gx.fillText(/fire/i.test(o.cat)?"🔥":/volcan/i.test(o.cat)?"🌋":/storm/i.test(o.cat)?"🌀":/ice/i.test(o.cat)?"🧊":"⚠",p.x,p.y+4);GV.hits.push({x:p.x,y:p.y,l:"events",o})}
+ if(L.quakes.on)for(const o of L.quakes.items){const p=proj(o.lon,o.lat);if(p.z<=0)continue;const r=Math.max(2.5,(o.mag-2)*2.6),ph=(now/900+o.mag)%1;
+  gx.strokeStyle=`rgba(251,113,133,${.7*(1-ph)})`;gx.lineWidth=1.2;gx.beginPath();gx.arc(p.x,p.y,r+ph*10,0,7);gx.stroke();gx.fillStyle="rgba(251,113,133,.85)";gx.beginPath();gx.arc(p.x,p.y,r*.55,0,7);gx.fill();GV.hits.push({x:p.x,y:p.y,l:"quakes",o})}
+ if(L.flights.on){gx.fillStyle="#fbbf24";const fdt=(performance.now()-L.flights.t)/3600000;
+  for(const o of L.flights.items){const dist=o.v*fdt,h=o.hd*RAD,la=o.lat+dist*Math.cos(h)/111.32,lo=o.lon+dist*Math.sin(h)/(111.32*Math.max(.1,Math.cos(o.lat*RAD)));
+   const p=proj(lo,la,1+o.alt/6371000*20);if(p.z<=0)continue;
+   if(GV.zoom>2.5){gx.save();gx.translate(p.x,p.y);gx.rotate(h);gx.beginPath();gx.moveTo(0,-4);gx.lineTo(3,3);gx.lineTo(-3,3);gx.closePath();gx.fill();gx.restore()}else gx.fillRect(p.x-1,p.y-1,2,2);
+   GV.hits.push({x:p.x,y:p.y,l:"flights",o})}}
+ if(L.sats.on){for(const o of L.sats.items){const s=satPos(o,now),p=proj(s.lon,s.lat,1+s.alt/RE);if(!p.vis)continue;
+  gx.fillStyle="#22d3ee";gx.shadowColor="#22d3ee";gx.shadowBlur=8;gx.beginPath();gx.arc(p.x,p.y,2.2,0,7);gx.fill();gx.shadowBlur=0;
+  if(L.sats.items.length<=40){gx.fillStyle="rgba(165,243,252,.8)";gx.font="10px Segoe UI";gx.textAlign="left";gx.fillText(o.OBJECT_NAME.slice(0,18),p.x+5,p.y-4)}
+  GV.hits.push({x:p.x,y:p.y,l:"sats",o})}}
+ if(sel&&sel.l==="sats"){const o=sel.o,per=satPos(o,now).period;gx.strokeStyle="rgba(34,211,238,.55)";gx.lineWidth=1.2;gx.beginPath();let first=true;
+  for(let k=0;k<=120;k++){const s=satPos(o,now+k/120*per*60000),p=proj(s.lon,s.lat,1+s.alt/RE);if(!p.vis){first=true;continue}if(first){gx.moveTo(p.x,p.y);first=false}else gx.lineTo(p.x,p.y)}gx.stroke()}
+ if(L.cas.on)for(const o of L.cas.items){const p=proj(o.lon,o.lat);if(p.z<=0)continue;gx.fillStyle="#e879f9";gx.shadowColor="#e879f9";gx.shadowBlur=14;
+  gx.beginPath();gx.moveTo(p.x,p.y-6);gx.lineTo(p.x+5,p.y);gx.lineTo(p.x,p.y+6);gx.lineTo(p.x-5,p.y);gx.closePath();gx.fill();gx.shadowBlur=0;
+  gx.fillStyle="#f5d0fe";gx.font="11px Segoe UI";gx.textAlign="left";gx.fillText(o.label,p.x+8,p.y+4);GV.hits.push({x:p.x,y:p.y,l:"cas",o})}
+ if(GV.mark){const p=proj(GV.mark.lon,GV.mark.lat);if(p.z>0){const ph=(now/1000)%1;gx.strokeStyle=`rgba(255,255,255,${1-ph})`;gx.lineWidth=1.5;gx.beginPath();gx.arc(p.x,p.y,4+ph*16,0,7);gx.stroke();
+  gx.fillStyle="#fff";gx.font="600 12px Segoe UI";gx.textAlign="left";gx.fillText(GV.mark.label||"",p.x+10,p.y-8)}}
+ if(sel){const pos=gPos(sel.l,sel.o,now),p=pos&&proj(pos.lon,pos.lat,sel.l==="sats"?1+pos.alt/RE:1);if(p&&p.vis){gx.strokeStyle="#fff";gx.lineWidth=1.5;gx.strokeRect(p.x-8,p.y-8,16,16)}}
+ if(now%1000<dt+20){$("#gclock").textContent=new Date(now).toISOString().slice(11,19)+" UTC";
+  $("#gstat").textContent=(GV.L.flights.src?"Самолёты: "+GV.L.flights.src:"")}}
+
+$("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
 setInterval(async()=>{try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
-window.addEventListener("load",()=>{renderTools();moveInk();sizeCv();loadCases()});
+window.addEventListener("load",()=>{renderTools();moveInk();sizeCv();loadCases();setTimeout(checkUpdates,4000)});
 </script></body></html>
 """
 
