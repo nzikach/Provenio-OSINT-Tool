@@ -38,7 +38,7 @@ import urllib.error
 from html.parser import HTMLParser
 
 APP_NAME = "Provenio"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 # каталог с ресурсами (в exe PyInstaller распаковывает их во временную папку)

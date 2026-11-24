@@ -459,6 +459,79 @@ class LabTests(unittest.TestCase):
         self.assertEqual(c.getresponse().status, 403)
 
 
+class SecTests(unittest.TestCase):
+    def test_magic_chains(self):
+        import base64
+        import gzip
+        import provenio_sec as S
+        secret = b"flag{provenio} the password is hunter2"
+        cases = {
+            base64.b64encode(gzip.compress(secret)).decode(): ["base64", "decompress"],
+            base64.b64encode(bytes(c ^ 0x2a for c in secret)).decode(): ["base64", "xor 0x2a"],
+            bytes(c ^ 7 for c in gzip.compress(secret)).hex(): ["hex", "xor 0x07", "decompress"],
+            secret.hex(): ["hex"],
+        }
+        for q, chain in cases.items():
+            r = S.magic_tool({"q": q})
+            self.assertEqual(r["output"]["text"], secret.decode(), q[:20])
+            self.assertEqual([s["op"] for s in r["steps"]], chain)
+        self.assertEqual(S.magic_tool({"q": "Uryyb jbeyq, guvf vf n frperg zrffntr"})["output"]["text"],
+                         "Hello world, this is a secret message")
+        self.assertEqual(S.magic_tool({"q": "hello world plain text"})["steps"], [])
+        r = S.magic_tool({"q": "recipe: b64 > gunzip\n" + base64.b64encode(gzip.compress(b"hi")).decode()})
+        self.assertEqual(r["output"]["text"], "hi")
+        with self.assertRaises(ValueError):
+            S.magic_tool({"q": "recipe: nope\nabc"})
+
+    def test_email_headers(self):
+        import provenio_sec as S
+        orig = S.X.geolocate_ips
+        S.X.geolocate_ips = lambda ips: {}       # офлайн
+        self.addCleanup(setattr, S.X, "geolocate_ips", orig)
+        hdr = ("Received: from a.evil.ru (a.evil.ru [185.220.101.4]) by mx.bank.com with ESMTPS; Mon, 23 Nov 2026 10:00:05 +0000\n"
+               "Received: from [192.168.1.2] (x [93.184.216.34]) by a.evil.ru with ESMTPSA; Mon, 23 Nov 2026 10:00:01 +0000\n"
+               "Authentication-Results: mx.bank.com; spf=softfail; dkim=pass header.d=evil.ru; dmarc=fail\n"
+               "DKIM-Signature: v=1; d=evil.ru; s=s1; b=x\n"
+               "From: \"PayPal\" <service@paypal.com>\nReply-To: r@paypal-help.top\nReturn-Path: <b@evil.ru>\nSubject: hi\n")
+        r = S.email_headers({"q": hdr})
+        self.assertEqual(r["verdict"], "подозрительное")
+        self.assertEqual(len(r["hops"]), 2)
+        self.assertEqual(r["hops"][0]["by"], "a.evil.ru")            # от отправителя к получателю
+        self.assertEqual(r["hops"][1]["delay"], 4.0)
+        self.assertEqual(r["origin_ip"], "93.184.216.34")
+        texts = " ".join(f["text"] for f in r["flags"])
+        for needle in ("Reply-To", "DMARC = fail", "Return-Path", "DKIM"):
+            self.assertIn(needle, texts)
+        with self.assertRaises(ValueError):
+            S.email_headers({"q": "просто текст без заголовков"})
+
+    def test_ct_parsing_and_matching(self):
+        import provenio_sec as S
+        self.assertEqual(S.tile_path(1234067), "x001/x234/067")
+        self.assertEqual(S.tile_path(5), "005")
+        # минимальный SAN: OID subjectAltName → OCTET STRING → SEQUENCE{[2]"a.com",[2]"b.org"}
+        gn = b"\x82\x05a.com\x82\x05b.org"
+        san = b"\x06\x03\x55\x1d\x11\x04" + bytes([len(gn) + 2]) + b"\x30" + bytes([len(gn)]) + gn
+        self.assertEqual(S.san_names(b"\x30\x00" + san), ["a.com", "b.org"])
+        cert = b"\x30\x10" + san
+        leaf = (1700000000000).to_bytes(8, "big") + b"\x00\x00" + len(cert).to_bytes(3, "big") + cert + b"\x00\x00" + b"\x00\x00"
+        self.assertEqual(S.parse_data_tile(leaf + leaf), [(1700000000000, ["a.com", "b.org"])] * 2)
+        self.assertEqual(S.ct_match("paypa1-login.com", ["paypal"], []), "paypal")
+        self.assertEqual(S.ct_match("secure-sberbanc.ru", ["sberbank"], []), "sberbank")
+        self.assertIsNone(S.ct_match("www.paypal.com", ["paypal"], ["paypal.com"]))
+        self.assertIsNone(S.ct_match("example.org", ["paypal"], []))
+
+    def test_jpeg_quality_estimate(self):
+        import provenio_sec as S
+        for q in (50, 75, 90):
+            sc = 5000 / q if q < 50 else 200 - 2 * q
+            nat = [min(255, max(1, int((v * sc + 50) // 100))) for v in S.STD_LUMA]
+            zz = [0] * 64
+            for i in range(64):
+                zz[i] = nat[S.ZIGZAG[i]]
+            self.assertEqual(S.jpeg_quality({0: zz}), (q, True))
+
+
 class UITests(unittest.TestCase):
     def test_page_and_api(self):
         import threading
@@ -515,7 +588,10 @@ class UITests(unittest.TestCase):
             self.assertTrue(call("labs_solved", {"id": 1, "k": labs["secret"], "fn": "alert"})["first"])
             self.assertIn("1", call("labs")["progress"]["solved"])
             self.assertIn("solution", call("labs_reveal", {"id": 3}))
-            for tab in ("p-globe", "p-radar", "p-leaks", "p-labs"):
+            ct = call("ct", {"action": "config", "keywords": ["MyBrand", "x"], "allow": ["mybrand.com"]})
+            self.assertEqual(ct["cfg"]["keywords"], ["mybrand"])           # слишком короткие отброшены
+            self.assertFalse(ct["running"])
+            for tab in ("p-globe", "p-radar", "p-leaks", "p-labs", "p-ct"):
                 self.assertIn(tab, page)
             world = direct.open(urllib.request.Request(base + "/static/world.json",
                                                        headers={"X-Token": tok["t"]})).read()

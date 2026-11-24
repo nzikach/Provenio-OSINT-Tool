@@ -32,6 +32,7 @@
 | Уязвимости | NVD (NIST), CISA KEV, FIRST EPSS |
 | Криптовалюта | Blockstream, mempool.space, Blockscout |
 | Глобус | OpenSky Network, airplanes.live, CelesTrak, USGS, NASA EONET, OpenStreetMap Nominatim |
+| Угрозы | ransomware.live (поиск жертв вымогателей — уходит только ваш запрос), журналы Certificate Transparency Let's Encrypt и список логов Google (CT-поток — только скачивание, о вас ничего не передаётся; ~90 МБ/ч, пока поток включён) |
 | Доказательства | службы времени RFC 3161: DigiCert, Sectigo, FreeTSA, SSL.com (только хэш) |
 | ИИ | Anthropic API* (только по кнопке, с предупреждением) |
 | Обновления | api.github.com (только если включено) |

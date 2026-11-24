@@ -27,6 +27,7 @@ import provenio_osint  # noqa: F401  (регистрирует новые инс
 import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, глобус, сценарии, ИИ-сводка
 import provenio_auth as A   # 2.2: локальная учётная запись
 import provenio_labs as XL  # 2.3: XSS-лаборатория (отдельный сервер, другой origin)
+import provenio_sec as SEC  # 2.4: магия, криминалистика фото, email, вымогатели, CT-поток
 
 S = P.Store()
 LOCK = S.lock
@@ -283,8 +284,13 @@ def job_status(jid):
 # ----------------------------------------------------------------- мониторинг страниц
 def monitor_loop():
     last_brand = 0
+    try:
+        sec_init()
+    except Exception:
+        traceback.print_exc()
     while True:
         time.sleep(30)
+        threading.Thread(target=SEC.RW.check, daemon=True).start()   # сама решает, пора ли (раз в 6 ч)
         try:
             for sid in S.due_monitors():
                 S.check_monitor(sid, capture=capture_fn())
@@ -293,6 +299,34 @@ def monitor_loop():
         if time.time() - last_brand > 120:
             last_brand = time.time()
             threading.Thread(target=brand_loop_once, daemon=True).start()
+
+
+# ----------------------------------------------------------------- 2.4: CT-поток и наблюдение за вымогателями
+def sec_api(path, body):
+    if path == "ct":
+        a = body.get("action")
+        if a == "config":
+            SEC.CT.configure(body.get("keywords"), body.get("allow"), body.get("background"))
+        elif a == "start":
+            SEC.CT.start()
+        elif a == "stop":
+            SEC.CT.stop()
+        return SEC.CT.status()
+    if path == "ransom_watch":
+        if body.get("keywords") is not None:
+            SEC.RW.set_keywords(body["keywords"])
+            threading.Thread(target=SEC.RW.check, kwargs={"force": True}, daemon=True).start()
+        return {"keywords": SEC.RW.cfg["keywords"], "last": SEC.RW.cfg.get("last", 0)}
+    raise KeyError(path)
+
+
+def sec_init():
+    SEC.CT.notify = lambda text: S.notify(None, text)
+    SEC.RW.notify = lambda text: S.notify(None, text)
+    SEC.CT.load()
+    SEC.RW.load()
+    if SEC.CT.cfg.get("background"):
+        SEC.CT.start()
 
 
 # ----------------------------------------------------------------- учётная запись
@@ -351,6 +385,7 @@ def account_api(path, body):
             raise ValueError("Введите слово УДАЛИТЬ для подтверждения")
         for rec in JOBS.values():
             rec["job"].cancelled = True
+        SEC.CT.stop()
         with LOCK:
             S.db.close()
             failed = A.wipe_data_dir(P.DATA_DIR)
@@ -359,6 +394,9 @@ def account_api(path, body):
         JOBS.clear()
         BLOBS.clear()
         TL.configure(P.load_settings())
+        SEC.CT.cfg.update({"keywords": [], "allow": [], "background": False})
+        SEC.CT.load()
+        SEC.RW.cfg.update({"keywords": [], "seen": {}, "last": 0})
         SESSION["tok"] = SESSION["user"] = None
         return {"deleted": True, "left": failed}
     raise KeyError(path)
@@ -601,6 +639,8 @@ def api(path, q, body):
         return settings_save(body) if body else settings_public()
     if path.startswith("labs"):
         return labs_api(path, q, body)
+    if path in ("ct", "ransom_watch"):
+        return sec_api(path, body)
     if path == "info":
         return {"version": P.APP_VERSION, "data_dir": P.DATA_DIR, "frozen": P.FROZEN, "portable": P.PORTABLE,
                 "sites": len(TL.load_sites()), "tools": len(TL.TOOLS), "browser": X.find_browser(),
@@ -1289,6 +1329,31 @@ input[type=checkbox]:checked::after{left:19px;background:radial-gradient(circle 
 .win{position:relative;overflow:hidden;border-color:rgba(52,211,153,.55)!important;box-shadow:var(--bevel),0 0 40px rgba(52,211,153,.35)!important;animation:pop .5s var(--spring)}
 .win h3{color:#6ee7b7}
 @media(max-width:820px){.labview{grid-template-columns:1fr}.lbrief{position:static}.bframe{height:62vh;min-height:360px}.lhero h2{font-size:24px}}
+
+/* ---------- 2.4: криминалистика, CT-поток, хронолокация ---------- */
+.fx{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
+.fx figure{margin:0;display:flex;flex-direction:column;gap:6px}.fx canvas,.fx img{width:100%;border-radius:12px;border:1px solid var(--edge);background:#000}
+.fx figcaption{font-size:11.5px;color:var(--mu)}
+.flag{padding:7px 11px;border-radius:11px;margin:5px 0;font-size:12.5px;border:1px solid var(--edge);background:rgba(255,255,255,.03)}
+.flag.bad{border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.08)}.flag.warn{border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.07)}
+.flag.ok{border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.06)}
+.chain{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}.chain span{padding:4px 10px;border-radius:99px;font:600 11.5px Consolas,monospace;
+ background:var(--violet);color:#fff;box-shadow:var(--bevel)}.chain i{color:var(--mu2);font-style:normal}
+.mout{white-space:pre-wrap;word-break:break-word;font:12.5px "JetBrains Mono",Consolas,monospace;background:rgba(0,0,0,.4);border:1px solid var(--edge);border-radius:12px;padding:10px 12px;max-height:280px;overflow:auto}
+#p-ct .cthead{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:14px;align-items:start}
+.ctstats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.ctstats .card{padding:12px}.ctstats b{display:block;font-size:24px;font-weight:800}
+.ctfeed{font:11.5px "JetBrains Mono",Consolas,monospace;height:300px;overflow:hidden;position:relative;mask-image:linear-gradient(#000 70%,transparent)}
+.ctfeed div{padding:3px 0;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;animation:rise .4s var(--ease)}
+.ctfeed div b{color:var(--tx);font-weight:500}
+.live{display:inline-flex;align-items:center;gap:7px;font-weight:800;font-size:12px;letter-spacing:1px}
+.live i{width:9px;height:9px;border-radius:50%;background:#f43f5e;box-shadow:0 0 12px #f43f5e;animation:glowDot 1.2s infinite}
+.live.off i{background:var(--mu2);box-shadow:none;animation:none}
+.ctm{border-left:3px solid #f43f5e;padding:8px 12px;margin:6px 0;border-radius:10px;background:rgba(244,63,94,.07);font-size:12.5px}
+.ctm code{font-size:12px}
+.tool[data-id="img_forensics"] .tres,.tool[data-id="email_headers"] .tres,.tool[data-id="magic"] .tres,.tool[data-id="ransomware"] .tres{max-height:none}
+.chrono label{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--mu);margin:5px 0}
+.chrono input{padding:7px 10px;font-size:12px}
+@media(max-width:820px){#p-ct .cthead{grid-template-columns:1fr}.ctstats{grid-template-columns:repeat(2,1fr)}}
 /* ---------- экран входа и регистрации ---------- */
 #auth{position:fixed;inset:0;z-index:90;display:grid;place-items:center;overflow:auto;padding:28px 16px;background:#030205}
 #auth .bg,#auth .liquid{position:absolute}
@@ -1401,6 +1466,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
   <button class="tab" data-t="leaks">Утечки</button>
   <button class="tab" data-t="tools">Инструменты</button>
   <button class="tab" data-t="labs">🧪 XSS-лаб</button>
+  <button class="tab" data-t="ct">🔴 CT-поток</button>
   <button class="tab" data-t="audit">Аудит</button>
   <span id="ink"></span>
  </div>
@@ -1424,6 +1490,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
   </div>
   <div class="panel" id="p-audit"><div class="tl" id="tl"></div></div>
   <div class="panel" id="p-labs"></div>
+  <div class="panel" id="p-ct"></div>
   <div class="panel" id="p-globe"><canvas id="gcv"></canvas>
    <div class="ghud card">
     <div class="gtitle">◉ ГЛОБУС <span id="gclock"></span></div>
@@ -1436,6 +1503,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
     <label class="gl"><input type="checkbox" data-l="cas" checked> ◆ Объекты кейса <b id="gn-cas">—</b></label>
     <label class="gl"><input type="checkbox" id="gnight" checked> 🌗 День и ночь</label>
     <label class="gl"><input type="checkbox" id="gauto" checked> ⟳ Вращение</label>
+    <button class="ghost" id="gchrono" style="justify-content:center">☀ Хронолокация по тени</button>
     <div class="pmsg" id="gstat"></div>
    </div>
    <div class="ginfo card" id="ginfo"></div>
@@ -1481,7 +1549,7 @@ function num(el,to){const f=+el.dataset.v||0;el.dataset.v=to;const t0=performanc
 function moveInk(){const b=$(".tab.on"),k=$("#ink");if(!b)return;k.style.width=b.offsetWidth+"px";k.style.transform="translateX("+(b.offsetLeft-28)+"px)"}
 function setTab(t){tab=t;$$(".tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
  $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(sizeCv,30);if(t==="time")renderTimeline();
- if(t==="globe")setTimeout(globeOpen,30);if(t==="labs")labsOpen()}
+ if(t==="globe")setTimeout(globeOpen,30);if(t==="labs")labsOpen();if(t==="ct")ctOpen()}
 $$(".tab").forEach(b=>b.onclick=()=>setTab(b.dataset.t));
 
 function renderCases(){$("#cases").innerHTML=cases.map((c,i)=>`<div class="case ${cur&&cur.id===c.id?"on":""}" data-id="${c.id}" style="animation-delay:${i*40}ms">${esc(c.name)}</div>`).join("")||'<div class="mu" style="padding:8px;color:var(--mu2)">Создайте первый кейс ↓</div>'}
@@ -1655,6 +1723,10 @@ async function showDiff(a,bb,el){el.innerHTML='<div class="prog ind"><i></i></di
 
 /* =================== ИНСТРУМЕНТЫ =================== */
 const TOOLS=[
+ {id:"magic",cat:"Утилиты",ic:"🪄",tn:"Магия декодирования (как CyberChef)",td:"Сам подберёт цепочку: base64/32/58, hex, URL, ROT/Цезарь, XOR с перебором ключа, gzip/zlib, Морзе, JWT… Ручной рецепт: первая строка «recipe: b64 > gunzip > xor:0x2a»",ph:"вставьте непонятную строку",area:1,wide:1,file:1},
+ {id:"img_forensics",cat:"Файлы и медиа",ic:"🔬",tn:"Криминалистика фото",td:"ELA (вклейки и правки), битовые плоскости (стеганография), миниатюра EXIF против фото, качество JPEG, следы редакторов",ph:"URL изображения (или выберите файл)",file:1,wide:1,accept:"image/*"},
+ {id:"email_headers",cat:"Информационная безопасность",ic:"📨",tn:"Разбор email-заголовков",td:"Путь письма по серверам (и на глобусе), SPF/DKIM/DMARC, подмена отправителя и Reply-To, задержки",ph:"вставьте исходник письма («Показать оригинал») или выберите .eml",area:1,wide:1,file:1,accept:".eml,.txt,message/rfc822"},
+ {id:"ransomware",cat:"Разведка организации",ic:"☠️",tn:"Утечки вымогателей",td:"Есть ли компания на сайтах утечек ransomware-группировок (ransomware.live). Можно поставить на наблюдение",ph:"название компании или домен"},
  {id:"phishing",cat:"Информационная безопасность",ic:"🎣",tn:"Проверка ссылки на фишинг",td:"Риск 0–100: признаки в адресе, бренд-двойник, возраст домена, сертификат, редиректы, форма пароля, репутация",ph:"https://подозрительная.ссылка",wide:1},
  {id:"ip_radar",cat:"Информационная безопасность",ic:"📡",tn:"IP-радар",td:"Вердикт по IP из ~20 открытых источников: угрозы, C2, Tor, VPN, облака, гео (можно список; есть отдельная вкладка)",ph:"1.2.3.4, 5.6.7.8"},
  {id:"leaks",cat:"OSINT: люди",ic:"💧",tn:"Утечки (XposedOrNot)",td:"Email, домен или пароль: в каких утечках, какие данные, уровень риска",ph:"user@example.com · домен · пароль"},
@@ -1750,7 +1822,7 @@ async function runTool(btn){
  if(RES[id]&&RES[id].state==="running")return;
  const qi=card.querySelector(".tq"),fi=card.querySelector(".tfile");let q=qi?qi.value.trim():"";
  const body={name:id,q};
- if(fi&&fi.files[0]&&(!q||q.startsWith("📎"))){try{body.file=await readFile(fi.files[0]);body.filename=fi.files[0].name;body.q=fi.files[0].name}catch(x){return toast(x.message,"bad")}}
+ if(fi&&fi.files[0]&&(!q||q.startsWith("📎"))){try{body.file=await readFile(fi.files[0]);body.filename=fi.files[0].name;body.q=fi.files[0].name;LASTFILE[id]=fi.files[0]}catch(x){return toast(x.message,"bad")}}
  else if(t.fileOnly)return toast("Выберите файл","bad");
  if(!body.q&&!body.file&&!["timestamp","uuid"].includes(id))return toast("Введите значение","bad");
  if(q.startsWith("📎")&&!body.file)return toast("Выберите файл заново","bad");
@@ -1827,6 +1899,10 @@ function fmtAny(d,depth){depth=depth||0;if(d==null)return'<span class="mu">—</
  return esc(d)}
 const SEVC={"критический":"c","высокий":"h","средний":"m","инфо":"i"};
 function fmtTool(id,d,body){
+ if(id==="magic")return magicView(d);
+ if(id==="img_forensics")return forensicsView(d);
+ if(id==="email_headers")return mailView(d);
+ if(id==="ransomware")return ransomView(d);
  if(id==="phishing")return phishView(d);
  if(id==="ip_radar")return radarView(d,true);
  if(id==="leaks")return leaksView(d);
@@ -2366,6 +2442,7 @@ function gTick(t){requestAnimationFrame(gTick);if(tab!=="globe"||!GW)return;cons
  if(L.cas.on)for(const o of L.cas.items){const p=proj(o.lon,o.lat);if(p.z<=0)continue;gx.fillStyle="#e879f9";gx.shadowColor="#e879f9";gx.shadowBlur=14;
   gx.beginPath();gx.moveTo(p.x,p.y-6);gx.lineTo(p.x+5,p.y);gx.lineTo(p.x,p.y+6);gx.lineTo(p.x-5,p.y);gx.closePath();gx.fill();gx.shadowBlur=0;
   gx.fillStyle="#f5d0fe";gx.font="11px Segoe UI";gx.textAlign="left";gx.fillText(o.label,p.x+8,p.y+4);GV.hits.push({x:p.x,y:p.y,l:"cas",o})}
+ drawOverlays(now);
  if(GV.mark){const p=proj(GV.mark.lon,GV.mark.lat);if(p.z>0){const ph=(now/1000)%1;gx.strokeStyle=`rgba(255,255,255,${1-ph})`;gx.lineWidth=1.5;gx.beginPath();gx.arc(p.x,p.y,4+ph*16,0,7);gx.stroke();
   gx.fillStyle="#fff";gx.font="600 12px Segoe UI";gx.textAlign="left";gx.fillText(GV.mark.label||"",p.x+10,p.y-8)}}
  if(sel){const pos=gPos(sel.l,sel.o,now),p=pos&&proj(pos.lon,pos.lat,sel.l==="sats"?1+pos.alt/RE:1);if(p&&p.vis){gx.strokeStyle="#fff";gx.lineWidth=1.5;gx.strokeRect(p.x-8,p.y-8,16,16)}}
@@ -2526,6 +2603,164 @@ window.addEventListener("message",e=>{const m=e.data;if(!m||typeof m!=="object"|
  const fr=$("#lframe");if(!fr||e.origin!=="null"&&e.origin!==labOrigin())return;
  if(m.nav&&e.source===fr.contentWindow){labNav=m.nav;$("#laddr").value=m.nav;return}
  if(m.fn)labWin(m)});
+
+/* =================== 2.4: МАГИЯ =================== */
+function outView(o){if(!o)return"";if(o.type==="text")return `<div class="mout">${esc(o.text)}</div>`;
+ if(o.type==="file")return kv("Файл",o.file_type+" · "+o.size+" байт")+`<div class="mout">${esc(o.hex)}</div>`+
+  (o.b64?`<a class="ghost" style="margin-top:6px" download="decoded.${(o.file_type||"bin").split("/")[0].toLowerCase()}" href="data:application/octet-stream;base64,${o.b64}">⬇ Сохранить файл</a>`:"");
+ return kv("Двоичные данные",o.size+" байт")+`<div class="mout">${esc(o.hex)}</div>`}
+function magicView(d){const ch=d.steps.length?`<div class="chain">${d.steps.map((s,i)=>`${i?"<i>→</i>":""}<span title="${esc(s.preview)}">${esc(s.op)}</span>`).join("")}</div>`:`<div class="pmsg">Похоже, это уже обычный текст — декодировать нечего.</div>`;
+ return (d.mode==="magic"?`<div class="row" style="gap:8px"><b>🪄 Найденная цепочка</b><span class="pmsg">уверенность ${Math.round(d.score*100)}%</span></div>`:`<b>📜 Рецепт</b>`)+ch+
+  (d.recipe&&d.mode==="magic"?`<div class="pmsg">Рецепт для повтора: <code>recipe: ${esc(d.recipe)}</code></div>`:"")+outView(d.output)+
+  (d.steps.length>1?sec("Шаги",d.steps.map((s,i)=>`<div class="kv"><b>${i+1}. ${esc(s.op)}</b><span class="pmsg" style="font-family:Consolas,monospace">${esc(s.preview)}</span></div>`).join("")):"")+
+  ((d.alternatives||[]).length?sec("Другие варианты",d.alternatives.map(a=>`<div class="kv"><b>${esc(a.chain.join(" → "))}</b><span>${esc(a.preview)}</span></div>`).join("")):"")}
+
+/* =================== 2.4: КРИМИНАЛИСТИКА ФОТО =================== */
+const LASTFILE={};
+function forensicsView(d){const j=d.jpeg||{},fid="fx"+Math.random().toString(36).slice(2,8);
+ const flags=(d.flags||[]).map(f=>`<div class="flag ${f.level==="warn"?"warn":""}">${f.level==="warn"?"⚠":"ℹ"} ${esc(f.text)}</div>`).join("")||`<div class="flag ok">Явных следов обработки в метаданных нет. Смотрите ELA ниже.</div>`;
+ setTimeout(()=>forensicsCanvas(fid,d),30);
+ return kv("Файл",`${d.name} · ${d.type} · ${(d.size/1024).toFixed(0)} KB`)+(j.quality?kv("Качество JPEG",`≈${j.quality}${j.standard_tables?" (стандартные таблицы)":" (нестандартные таблицы)"}${j.progressive?" · progressive":""}`):"")+
+  (j.size?kv("Размер",j.size.join("×")+" px"):"")+(d.xmp&&d.xmp.creator_tool?kv("Создано в",d.xmp.creator_tool):"")+(d.xmp&&d.xmp.history.length?kv("История правок",d.xmp.history.join(", ")):"")+
+  sec("Признаки",flags)+
+  `<div class="fx" id="${fid}"><div class="pmsg">Готовлю ELA и битовые плоскости…</div></div>
+  <div class="row" style="margin-top:8px;gap:10px"><label class="pmsg" style="display:flex;gap:8px;align-items:center">Усиление ELA <input type="range" min="5" max="60" value="20" data-ela="${fid}" style="width:160px;padding:0"></label>
+   <label class="pmsg" style="display:flex;gap:8px;align-items:center">Бит <select data-bit="${fid}" style="width:auto;padding:4px 8px"><option>0</option><option>1</option><option>2</option></select></label></div>
+  <div class="pmsg" style="margin-top:6px">ELA: области с иной историей сжатия светятся ярче — у вклеек и подретушированных мест «другая яркость шума». Однородный шум по всему кадру — норма.
+  Битовая плоскость: у обычного фото младший бит похож на шум; чёткие узоры и полосы — признак скрытых данных (LSB-стеганография).</div>`}
+async function fxImage(d){let src;if(d.image_b64)src=`data:${d.mime||"image/jpeg"};base64,${d.image_b64}`;
+ else if(LASTFILE.img_forensics)src=URL.createObjectURL(LASTFILE.img_forensics);else return null;
+ const im=new Image();im.src=src;await im.decode();return im}
+function fxCanvas(w,h){const c=document.createElement("canvas");c.width=w;c.height=h;return c}
+async function forensicsCanvas(fid,d){const box=document.getElementById(fid);if(!box)return;let im;
+ try{im=await fxImage(d)}catch(x){im=null}if(!im){box.innerHTML='<div class="pmsg">Изображение недоступно для анализа в окне (формат не поддерживается браузером).</div>';return}
+ const sc=Math.min(1,1400/Math.max(im.naturalWidth,im.naturalHeight)),W=Math.round(im.naturalWidth*sc),H=Math.round(im.naturalHeight*sc);
+ const a=fxCanvas(W,H),ax=a.getContext("2d",{willReadFrequently:true});ax.drawImage(im,0,0,W,H);const A=ax.getImageData(0,0,W,H).data;
+ const blob=await new Promise(r=>a.toBlob(r,"image/jpeg",.9));const im2=new Image();im2.src=URL.createObjectURL(blob);await im2.decode();
+ const b=fxCanvas(W,H),bx=b.getContext("2d",{willReadFrequently:true});bx.drawImage(im2,0,0);const B=bx.getImageData(0,0,W,H).data;
+ const ela=fxCanvas(W,H),ex=ela.getContext("2d"),bit=fxCanvas(W,H),btx=bit.getContext("2d");
+ function drawEla(k){const o=ex.createImageData(W,H);for(let i=0;i<A.length;i+=4){o.data[i]=Math.min(255,Math.abs(A[i]-B[i])*k);o.data[i+1]=Math.min(255,Math.abs(A[i+1]-B[i+1])*k);
+  o.data[i+2]=Math.min(255,Math.abs(A[i+2]-B[i+2])*k);o.data[i+3]=255}ex.putImageData(o,0,0)}
+ // для LSB берём исходный размер без масштабирования (масштаб портит младшие биты)
+ const fw=Math.min(im.naturalWidth,1400),fh=Math.min(im.naturalHeight,1400),f=fxCanvas(fw,fh),fxx=f.getContext("2d",{willReadFrequently:true});fxx.drawImage(im,0,0);
+ const F=fxx.getImageData(0,0,fw,fh).data;bit.width=fw;bit.height=fh;
+ function drawBit(n){const o=btx.createImageData(fw,fh);for(let i=0;i<F.length;i+=4){o.data[i]=(F[i]>>n&1)*255;o.data[i+1]=(F[i+1]>>n&1)*255;o.data[i+2]=(F[i+2]>>n&1)*255;o.data[i+3]=255}btx.putImageData(o,0,0)}
+ drawEla(20);drawBit(0);
+ // LSB-извлечение: биты RGB подряд → байты; ищем текст или сигнатуру файла
+ let bytes=[],cur=0,nb=0;for(let i=0;i<F.length&&bytes.length<4096;i++){if(i%4===3)continue;cur=cur<<1|F[i]&1;if(++nb===8){bytes.push(cur);cur=0;nb=0}}
+ const pr=bytes.slice(0,400).filter(x=>x>=32&&x<127||x===10).length/400,txt=String.fromCharCode(...bytes.slice(0,240)).replace(/[^\x20-\x7e\n]/g,"·");
+ const sig=bytes.slice(0,4).map(x=>x.toString(16).padStart(2,"0")).join(" ");
+ const lsbNote=pr>.85?`<div class="flag warn">⚠ Младшие биты складываются в читаемый текст — вероятно, скрытое сообщение: <code>${esc(txt.slice(0,160))}</code></div>`:
+  ["89 50 4e 47","ff d8 ff e0","ff d8 ff e1","50 4b 03 04","25 50 44 46"].includes(sig)?`<div class="flag warn">⚠ В младших битах сигнатура файла (${sig}) — спрятан файл.</div>`:`<div class="pmsg">LSB-поток (RGB, бит 0) на текст и файлы не похож.</div>`;
+ let thumb="";if(d.thumbnail){thumb=`<figure><img id="${fid}t" src="data:image/jpeg;base64,${d.thumbnail.b64}"><figcaption>Миниатюра из EXIF <span id="${fid}tm"></span></figcaption></figure>`}
+ box.innerHTML=`<figure><img src="${a.toDataURL("image/jpeg",.85)}"><figcaption>Оригинал</figcaption></figure><figure id="${fid}e"></figure><figure id="${fid}b"></figure>${thumb}<div style="grid-column:1/-1">${lsbNote}</div>`;
+ const fe=document.getElementById(fid+"e");fe.append(ela);fe.insertAdjacentHTML("beforeend","<figcaption>ELA — анализ уровня ошибок</figcaption>");
+ const fb=document.getElementById(fid+"b");fb.append(bit);fb.insertAdjacentHTML("beforeend","<figcaption>Битовая плоскость (стеганография)</figcaption>");
+ if(d.thumbnail){const ti=document.getElementById(fid+"t");await ti.decode().catch(()=>{});const tw=32,th=32,c1=fxCanvas(tw,th),c2=fxCanvas(tw,th),x1=c1.getContext("2d"),x2=c2.getContext("2d");
+  x1.drawImage(a,0,0,tw,th);x2.drawImage(ti,0,0,tw,th);const p1=x1.getImageData(0,0,tw,th).data,p2=x2.getImageData(0,0,tw,th).data;let df=0;for(let i=0;i<p1.length;i+=4)df+=Math.abs(p1[i]-p2[i])+Math.abs(p1[i+1]-p2[i+1])+Math.abs(p1[i+2]-p2[i+2]);
+  df=df/(tw*th*3);document.getElementById(fid+"tm").innerHTML=df>28?`<b style="color:var(--warn)">— НЕ совпадает с фото (разница ${df.toFixed(0)}): снимок обрезали или изменили после съёмки</b>`:`— совпадает с фото (разница ${df.toFixed(0)})`}
+ document.querySelector(`[data-ela="${fid}"]`).oninput=e=>drawEla(+e.target.value);
+ document.querySelector(`[data-bit="${fid}"]`).onchange=e=>drawBit(+e.target.value)}
+
+/* =================== 2.4: EMAIL =================== */
+const MAILROUTE={};
+function mailView(d){const col={bad:"var(--bad)",warn:"var(--warn)",ok:"var(--ok)",info:"var(--mu)"};
+ const v=d.verdict==="подозрительное"?"bad":d.verdict==="есть вопросы"?"warn":"ok",rid="m"+Math.random().toString(36).slice(2,8);MAILROUTE[rid]=d.hops;
+ return `<div class="flag ${v}" style="font-size:14px"><b>Вердикт: ${esc(d.verdict)}</b></div>`+kv("Тема",d.subject)+kv("От",d.from)+kv("Кому",d.to)+kv("Reply-To",d.reply_to)+kv("Return-Path",d.return_path)+kv("Дата",d.date)+kv("Почтовый клиент",d.x_mailer)+
+  `<div class="row" style="gap:6px;margin:8px 0">${["spf","dkim","dmarc"].map(k=>{const r=(d.auth[k]||"нет").toLowerCase();return `<span class="pill ${r==="pass"?"ok":r==="нет"?"":"bad"}">${k.toUpperCase()}: ${esc(r)}</span>`}).join("")}</div>`+
+  sec("Признаки",(d.flags||[]).map(f=>`<div class="flag ${f.level==="bad"?"bad":f.level==="warn"?"warn":f.level==="ok"?"ok":""}" style="color:${col[f.level]}">${esc(f.text)}</div>`).join("")||"—")+
+  sec(`Путь письма — ${d.hops.length} хопов${d.transit_sec!=null?`, ${d.transit_sec} с в пути`:""}`,tbl(["#","Откуда","Куда","IP","Где","Задержка","TLS"],d.hops.map((h,i)=>[i+1,esc(h.from||"—"),esc(h.by||"—"),esc(h.ips.join(", ")),
+   h.geo?esc([h.geo.city,h.geo.country].filter(Boolean).join(", "))+`<br><small class="mu">${esc(h.geo.isp||"")}</small>`:"—",h.delay!=null?h.delay+" с":"",h.tls?"🔒":""])))+
+  (d.hops.some(h=>h.geo)?`<button class="ghost" style="margin-top:8px" onclick="mailOnGlobe('${rid}')">🌍 Показать путь на глобусе</button>`:"")+(d.origin_ip?kv("Исходный IP отправителя",d.origin_ip):"")}
+function mailOnGlobe(rid){const pts=(MAILROUTE[rid]||[]).filter(h=>h.geo&&h.geo.lat!=null).map((h,i)=>({lon:h.geo.lon,lat:h.geo.lat,label:`${i+1}. ${h.geo.city||h.geo.country||h.geo.ip}`}));
+ if(!pts.length)return toast("Нет координат серверов","bad");GV.route=pts;globeGo(pts[0].lon,pts[0].lat,pts[0].label)}
+
+/* =================== 2.4: ВЫМОГАТЕЛИ =================== */
+function ransomView(d){return `<div class="flag ${d.count?"bad":"ok"}" style="font-size:13.5px">${d.count?`☠ Найдено упоминаний на сайтах утечек: <b>${d.count}</b>`:"✓ По этому запросу жертв на сайтах утечек не найдено"}</div>`+
+ (d.groups.length?`<div class="row" style="gap:6px;margin:6px 0">${d.groups.map(([g,n])=>`<span class="tag">${esc(g)} ×${n}</span>`).join("")}</div>`:"")+
+ (d.victims.length?tbl(["Жертва","Группа","Страна","Атака / обнаружено","Описание"],d.victims.map(v=>[`<b>${esc(v.victim)}</b>${v.domain?`<br><small class="mu">${esc(v.domain)}</small>`:""}`,esc(v.group),esc(v.country),
+  `${esc(v.attackdate)}<br><small class="mu">${esc(v.discovered)}</small>`,`<small>${esc(v.description)}</small>`])):"")+
+ `<div class="row" style="margin-top:8px;gap:8px"><button class="ghost" data-rw="${esc(d.query)}" onclick="ransomWatch(this.dataset.rw)">👁 Следить за «${esc(d.query)}»</button><span class="pmsg">${esc(d.source)}. ${esc(d.note)}</span></div>`}
+async function ransomWatch(kw){try{const c=await api("ransom_watch");const k=[...new Set([...(c.keywords||[]),kw])];await api("ransom_watch",{keywords:k});
+ toast(`Наблюдение включено: ${k.join(", ")}. Проверка раз в 6 часов, новое — в уведомлениях`,"ok")}catch(x){toast(x.message,"bad")}}
+
+/* =================== 2.4: ХРОНОЛОКАЦИЯ ПО ТЕНЯМ =================== */
+function solar(t){const n=t/864e5+2440587.5-2451545,L=(280.46+.9856474*n)%360,g=((357.528+.9856003*n)%360)*RAD,
+ lam=(L+1.915*Math.sin(g)+.02*Math.sin(2*g))*RAD,eps=(23.439-4e-7*n)*RAD,ra=Math.atan2(Math.cos(eps)*Math.sin(lam),Math.cos(lam)),
+ dec=Math.asin(Math.sin(eps)*Math.sin(lam)),gmst=(280.46061837+360.98564736629*n)%360;let lon=(ra/RAD-gmst)%360;lon=(lon+540)%360-180;return{lat:dec/RAD,lon}}
+function sunElAz(lat,lon,t){const s=solar(t),p=lat*RAD,d=s.lat*RAD,H=(lon-s.lon)*RAD;
+ const el=Math.asin(Math.sin(p)*Math.sin(d)+Math.cos(p)*Math.cos(d)*Math.cos(H))/RAD;
+ const az=(Math.atan2(-Math.sin(H)*Math.cos(d),Math.cos(p)*Math.sin(d)-Math.sin(p)*Math.cos(d)*Math.cos(H))/RAD+360)%360;return{el,az}}
+function gDest(lat,lon,brg,dist){const p1=lat*RAD,l1=lon*RAD,th=brg*RAD,de=dist*RAD,p2=Math.asin(Math.sin(p1)*Math.cos(de)+Math.cos(p1)*Math.sin(de)*Math.cos(th)),
+ l2=l1+Math.atan2(Math.sin(th)*Math.sin(de)*Math.cos(p1),Math.cos(de)-Math.sin(p1)*Math.sin(p2));return[((l2/RAD+540)%360)-180,p2/RAD]}
+const angDiff=(a,b)=>Math.abs(((a-b)%360+540)%360-180);
+function chronoPanel(){const el=$("#ginfo");el.classList.add("show");GV.sel=null;const now=new Date().toISOString().slice(0,16);
+ el.innerHTML=`<h4>☀ Хронолокация по тени<button class="x">✕</button></h4><div class="chrono">
+  <div class="pmsg">Измерьте на фото высоту любого вертикального объекта и длину его тени (в одних единицах: пикселях, метрах, шагах).</div>
+  <div class="row" style="gap:8px;flex-wrap:nowrap"><label>Высота<input id="ch-h" type="number" step="any" value="1"></label><label>Тень<input id="ch-l" type="number" step="any" value="1.2"></label></div>
+  <label>Дата и время снимка (UTC)<input id="ch-t" type="datetime-local" value="${now}"></label>
+  <label>Направление тени, ° (необязательно; 0 — север, 90 — восток)<input id="ch-az" type="number" step="any" placeholder="например 315"></label>
+  <div class="row" style="gap:6px;margin-top:6px"><button class="btn" id="ch-where" style="padding:8px 13px">Где?</button><button class="ghost" id="ch-when">Когда? (для метки на глобусе)</button><button class="ghost" id="ch-clear">✕</button></div>
+  <div class="pmsg" id="ch-res" style="margin-top:8px"></div></div>`;
+ const g=id=>+el.querySelector(id).value,ts=()=>Date.parse(el.querySelector("#ch-t").value+":00Z");
+ el.querySelector("#ch-where").onclick=()=>{const h=g("#ch-h"),L=g("#ch-l"),t=ts();if(!(h>0&&L>0)||isNaN(t))return toast("Заполните высоту, тень и время","bad");
+  const e=Math.atan(h/L)/RAD,s=solar(t),ring=[];for(let b=0;b<=360;b+=1)ring.push(gDest(s.lat,s.lon,b,90-e));
+  const azs=el.querySelector("#ch-az").value.trim(),hits=[];if(azs!==""){const sa=(+azs+180)%360;for(const[lo,la]of ring){if(angDiff(sunElAz(la,lo,t).az,sa)<4)hits.push([lo,la])}}
+  GV.chrono={ring,hits,sun:s};const c=hits.length?hits[Math.floor(hits.length/2)]:[s.lon,s.lat];GV.fly={lon:c[0],lat:c[1]};GV.auto=false;$("#gauto").checked=false;
+  el.querySelector("#ch-res").innerHTML=`Высота солнца <b>${e.toFixed(1)}°</b>. Снимок сделан где-то на <b style="color:#fde68a">жёлтой окружности</b> (все точки, где солнце в это время стоит на ${e.toFixed(1)}°).`+
+   (azs!==""?(hits.length?` По направлению тени остаётся <b style="color:#f43f5e">красный участок</b> — ${hits.length>1?"примерно "+Math.round(hits.length*111.2*Math.sin((90-e)*RAD))+" км":"точка"}: от ${hits[0][1].toFixed(1)}°, ${hits[0][0].toFixed(1)}° до ${hits[hits.length-1][1].toFixed(1)}°, ${hits[hits.length-1][0].toFixed(1)}°.`:" С таким направлением тени точек нет — проверьте время (UTC!) и угол."):" Укажите направление тени, чтобы сузить до участка.")+
+   `<br><span class="mu">Точность ±1–2°: рельеф, наклон поверхности и рефракция у горизонта.</span>`};
+ el.querySelector("#ch-when").onclick=()=>{const m=GV.mark||{lon:GV.lon,lat:GV.lat,label:"центр глобуса"},h=g("#ch-h"),L=g("#ch-l"),t=ts();if(!(h>0&&L>0)||isNaN(t))return toast("Заполните высоту, тень и дату","bad");
+  const e=Math.atan(h/L)/RAD,day=Date.UTC(new Date(t).getUTCFullYear(),new Date(t).getUTCMonth(),new Date(t).getUTCDate()),azs=el.querySelector("#ch-az").value.trim(),out=[];let prev=-9;
+  for(let k=0;k<1440;k++){const tt=day+k*6e4,p=sunElAz(m.lat,m.lon,tt);if(Math.abs(p.el-e)<.35&&(azs===""||angDiff(p.az,(+azs+180)%360)<6)){if(k-prev>5)out.push({tt,az:p.az});prev=k}}
+  const loc=x=>new Date(x+m.lon/15*36e5).toISOString().slice(11,16);
+  el.querySelector("#ch-res").innerHTML=`Для «${esc(m.label||"точки")}» (${m.lat.toFixed(2)}°, ${m.lon.toFixed(2)}°) в этот день солнце на ${e.toFixed(1)}° `+
+   (out.length?`было в: ${out.map(o=>`<b>${new Date(o.tt).toISOString().slice(11,16)} UTC</b> (≈${loc(o.tt)} по солнцу, тень на ${((o.az+180)%360).toFixed(0)}°)`).join("; ")}.`:"не стояло ни разу — проверьте дату или место.")};
+ el.querySelector("#ch-clear").onclick=()=>{GV.chrono=null;el.querySelector("#ch-res").textContent=""}}
+function drawOverlays(now){
+ if(GV.chrono){gx.save();gx.setLineDash([6,5]);gx.strokeStyle="rgba(253,230,138,.85)";gx.lineWidth=1.6;gx.beginPath();gPath(GV.chrono.ring,false);gx.stroke();gx.setLineDash([]);
+  if(GV.chrono.hits.length){gx.strokeStyle="#f43f5e";gx.lineWidth=4;gx.shadowColor="#f43f5e";gx.shadowBlur=12;gx.beginPath();gPath(GV.chrono.hits,false);gx.stroke();gx.shadowBlur=0}
+  const sp=proj(GV.chrono.sun.lon,GV.chrono.sun.lat);if(sp.z>0){gx.fillStyle="#fde68a";gx.font="15px Segoe UI Emoji";gx.textAlign="center";gx.fillText("☀",sp.x,sp.y+5)}gx.restore()}
+ if(GV.route&&GV.route.length){gx.save();gx.strokeStyle="#22d3ee";gx.lineWidth=2;gx.shadowColor="#22d3ee";gx.shadowBlur=10;
+  for(let i=1;i<GV.route.length;i++){const a=GV.route[i-1],b=GV.route[i],seg=[];for(let k=0;k<=40;k++){const f=k/40;seg.push(gInterp(a,b,f))}gx.beginPath();gPath(seg,false);gx.stroke()}
+  gx.shadowBlur=0;GV.route.forEach(r=>{const p=proj(r.lon,r.lat);if(p.z<=0)return;gx.fillStyle="#22d3ee";gx.beginPath();gx.arc(p.x,p.y,4,0,7);gx.fill();gx.fillStyle="#cffafe";gx.font="11px Segoe UI";gx.textAlign="left";gx.fillText(r.label,p.x+7,p.y-6)});gx.restore()}}
+function gInterp(a,b,f){const p1=a.lat*RAD,l1=a.lon*RAD,p2=b.lat*RAD,l2=b.lon*RAD,d=2*Math.asin(Math.sqrt(Math.sin((p2-p1)/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin((l2-l1)/2)**2));
+ if(d<1e-9)return[a.lon,a.lat];const A=Math.sin((1-f)*d)/Math.sin(d),B=Math.sin(f*d)/Math.sin(d),x=A*Math.cos(p1)*Math.cos(l1)+B*Math.cos(p2)*Math.cos(l2),
+ y=A*Math.cos(p1)*Math.sin(l1)+B*Math.cos(p2)*Math.sin(l2),z=A*Math.sin(p1)+B*Math.sin(p2);return[Math.atan2(y,x)/RAD,Math.atan2(z,Math.hypot(x,y))/RAD]}
+
+/* =================== 2.4: CT-ПОТОК =================== */
+let CTT=null;
+async function ctOpen(){let s;try{s=await api("ct")}catch(x){$("#p-ct").innerHTML=`<div class="empty"><b>Недоступно</b>${esc(x.message)}</div>`;return}
+ if(!$("#ctkw")){$("#p-ct").innerHTML=`<div class="lhero"><div class="lring" style="--p:100"><b>CT</b></div><div><h2>ПОТОК СЕРТИФИКАТОВ</h2>
+  <div class="sub">Каждый TLS-сертификат публикуется в журналах Certificate Transparency. Provenio читает свежие записи логов Let's Encrypt (через них выпускается
+  большинство фишинговых сертификатов) и сразу сообщает, если появился домен, похожий на ваш бренд: <code>paypa1-login.com</code>, <code>secure-sberbanc.ru</code>…</div></div></div>
+  <div class="cthead"><div class="card" style="display:flex;flex-direction:column;gap:9px">
+   <div class="row"><span class="live off" id="ctlive"><i></i>ВЫКЛЮЧЕН</span><span class="grow"></span><button class="btn" id="ctgo">▶ Запустить</button></div>
+   <label class="f">Ключевые слова бренда (по одному в строке)<textarea id="ctkw" rows="4" placeholder="paypal&#10;sberbank&#10;mycompany"></textarea></label>
+   <label class="f">Свои домены — не считать угрозой<textarea id="ctal" rows="2" placeholder="paypal.com&#10;paypal.me"></textarea></label>
+   <label class="cons"><input type="checkbox" id="ctbg"> <span>Работать в фоне, пока открыт Provenio</span></label>
+   <button class="ghost" id="ctsave">Сохранить</button>
+   <div class="pmsg">Ищем вхождение слова и «опечатки» (1 символ, 0→o, 1→l…). Трафик — примерно <b id="ctmb">90</b> МБ в час, пока поток включён.
+   Охват: логи Let's Encrypt, не все центры сертификации.</div></div>
+   <div style="display:flex;flex-direction:column;gap:12px"><div class="ctstats"><div class="card"><span class="pmsg">сертификатов/с</span><b id="ct-rate">—</b></div>
+    <div class="card"><span class="pmsg">прочитано</span><b id="ct-n">0</b></div><div class="card"><span class="pmsg">совпадений</span><b id="ct-m">0</b></div><div class="card"><span class="pmsg">трафик</span><b id="ct-mb">0</b></div></div>
+    <div class="card"><div class="row"><b style="font-size:13px">Живая лента</b><span class="pmsg grow" id="ct-err"></span></div><div class="ctfeed" id="ctfeed"></div></div></div></div>
+  <div class="card" style="margin-top:14px"><b style="font-size:13px">🔴 Совпадения</b><div id="ctmatch"><div class="pmsg">Пока пусто.</div></div></div>`;
+  $("#ctkw").value=(s.cfg.keywords||[]).join("\n");$("#ctal").value=(s.cfg.allow||[]).join("\n");$("#ctbg").checked=!!s.cfg.background;$("#ctmb").textContent=s.est_mb_per_hour;
+  const cfg=()=>({keywords:$("#ctkw").value.split(/\n|,/),allow:$("#ctal").value.split(/\n|,/),background:$("#ctbg").checked});
+  $("#ctsave").onclick=async()=>{await api("ct",{action:"config",...cfg()});toast("Сохранено","ok")};
+  ctBind();$("#ctgo").onclick=async()=>{const r=await api("ct");await api("ct",{action:"config",...cfg()});await api("ct",{action:r.running?"stop":"start"});ctPoll()}}
+ ctDraw(s);clearInterval(CTT);CTT=setInterval(()=>{if(tab!=="ct")return clearInterval(CTT);ctPoll()},2000)}
+async function ctPoll(){try{ctDraw(await api("ct"))}catch(x){}}
+function ctDraw(s){const l=$("#ctlive");if(!l)return;l.className="live"+(s.running?"":" off");l.innerHTML=`<i></i>${s.running?"В ЭФИРЕ":"ВЫКЛЮЧЕН"}`;$("#ctgo").textContent=s.running?"■ Остановить":"▶ Запустить";
+ const st=s.stats;$("#ct-rate").textContent=s.running?st.rate:"—";$("#ct-n").textContent=st.certs.toLocaleString("ru");$("#ct-m").textContent=s.matches.length;
+ $("#ct-mb").textContent=(st.bytes/1e6).toFixed(1)+" МБ";$("#ct-err").textContent=st.last_error?"⚠ "+st.last_error:(st.skipped?`пропущено при догоне: ${st.skipped}`:"");
+ $("#ctfeed").innerHTML=s.feed.slice().reverse().map(f=>`<div>${new Date(f.t).toISOString().slice(11,19)} <b>${esc(f.d)}</b>${f.n>1?` +${f.n-1}`:""}</div>`).join("")||'<div>Запустите поток, и здесь побегут свежие сертификаты.</div>';
+ $("#ctmatch").innerHTML=s.matches.length?s.matches.map(m=>`<div class="ctm"><b>${esc(m.domains.join(", "))}</b> <span class="mu">· ключ «${esc(m.keyword)}» · ${esc(m.time)} · ${esc(m.log)}</span>
+  <div class="row" style="gap:6px;margin-top:5px">${m.domains.slice(0,3).map(d=>`<button class="ghost" style="padding:5px 10px" data-ctd="${esc(d.replace(/^\*\./,""))}">🎣 Проверить ${esc(d.replace(/^\*\./,""))}</button>`).join("")}</div></div>`).join(""):'<div class="pmsg">Пока пусто. Добавьте ключевые слова и запустите поток.</div>'}
+function ctBind(){const m=$("#ctmatch");if(m)m.onclick=e=>{const b=e.target.closest("[data-ctd]");if(b)ctCheck(b.dataset.ctd)}}
+function ctCheck(d){setTab("tools");setTimeout(()=>{const c=document.querySelector('.tool[data-id="phishing"]');if(!c)return;c.querySelector(".tq").value="https://"+d;runTool(c.querySelector(".tf-act"))},200)}
+$("#gchrono").onclick=chronoPanel;
 $("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
 setInterval(async()=>{if(!ME)return;try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
 window.addEventListener("load",showAuth);
