@@ -65,6 +65,7 @@ jobs:
       - name: Audit third-party packages (pip-audit)
         shell: powershell
         run: |
+          $env:PYTHONUTF8 = "1"   # requirements-build.txt содержит русские комментарии
           .venv\Scripts\python -m pip install --quiet pip-audit
           $out = (cmd /c ".venv\Scripts\python -m pip_audit -r requirements-build.txt 2>&1" | Out-String)
           $code = $LASTEXITCODE
