@@ -26,6 +26,7 @@ import provenio_tools as TL
 import provenio_osint  # noqa: F401  (регистрирует новые инструменты в TL.TOOLS)
 import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, глобус, сценарии, ИИ-сводка
 import provenio_auth as A   # 2.2: локальная учётная запись
+import provenio_labs as XL  # 2.3: XSS-лаборатория (отдельный сервер, другой origin)
 
 S = P.Store()
 LOCK = S.lock
@@ -363,6 +364,64 @@ def account_api(path, body):
     raise KeyError(path)
 
 
+# ----------------------------------------------------------------- XSS-лаборатория
+def labs_progress_path():
+    return os.path.join(P.DATA_DIR, "labs.json")
+
+
+def labs_progress():
+    try:
+        with open(labs_progress_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    return {"solved": d.get("solved") or {}, "revealed": d.get("revealed") or [], "hints": d.get("hints") or {}}
+
+
+def labs_save(d):
+    os.makedirs(P.DATA_DIR, exist_ok=True)
+    with open(labs_progress_path(), "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+
+
+def labs_api(path, q, body):
+    qv = lambda k: (q.get(k) or [""])[0]   # noqa: E731
+    if path == "labs":
+        pr = labs_progress()
+        fixes = {k: XL.BY_ID[int(k)]["fix"] for k in pr["solved"] if int(k) in XL.BY_ID}
+        return {"port": XL.ensure_server(), "secret": XL.SECRET, "labs": XL.catalog(), "levels": XL.LEVELS,
+                "progress": pr, "fixes": fixes}
+    lab_id = int(body.get("id") or qv("id"))
+    if lab_id not in XL.BY_ID:
+        raise KeyError("Нет такой лабы")
+    pr = labs_progress()
+    if path == "labs_solved":
+        if not secrets.compare_digest(str(body.get("k", "")), XL.SECRET):
+            raise ValueError("Решение не подтверждено")
+        first = str(lab_id) not in pr["solved"]
+        pr["solved"].setdefault(str(lab_id), {"ts": P.now_iso(), "fn": str(body.get("fn", ""))[:20],
+                                              "hints": pr["hints"].get(str(lab_id), 0),
+                                              "revealed": lab_id in pr["revealed"]})
+        labs_save(pr)
+        return {"first": first, "fix": XL.BY_ID[lab_id]["fix"], "solved": len(pr["solved"])}
+    if path == "labs_hint":
+        pr["hints"][str(lab_id)] = max(pr["hints"].get(str(lab_id), 0), min(3, int(body.get("n") or 1)))
+        labs_save(pr)
+        return {}
+    if path == "labs_reveal":
+        if lab_id not in pr["revealed"]:
+            pr["revealed"].append(lab_id)
+            labs_save(pr)
+        return XL.reveal(lab_id)
+    if path == "labs_reset":
+        XL.reset(lab_id)
+        return {}
+    if path == "labs_exploit":
+        XL.set_exploit(lab_id, body.get("html", ""))
+        return {}
+    raise KeyError(path)
+
+
 # ----------------------------------------------------------------- настройки
 def settings_public():
     s = P.load_settings()
@@ -540,6 +599,8 @@ def api(path, q, body):
         return S.pop_notifications()
     if path == "settings":
         return settings_save(body) if body else settings_public()
+    if path.startswith("labs"):
+        return labs_api(path, q, body)
     if path == "info":
         return {"version": P.APP_VERSION, "data_dir": P.DATA_DIR, "frozen": P.FROZEN, "portable": P.PORTABLE,
                 "sites": len(TL.load_sites()), "tools": len(TL.TOOLS), "browser": X.find_browser(),
@@ -1186,6 +1247,48 @@ input[type=checkbox]:checked::after{left:19px;background:radial-gradient(circle 
 .md a{color:var(--ac2)}.md pre{background:rgba(0,0,0,.4);border:1px solid var(--edge);border-radius:12px;padding:10px 12px;overflow:auto;font:12px Consolas,monospace}
 .md table{display:block;overflow-x:auto}
 
+
+/* ---------- 2.3: XSS-лаборатория ---------- */
+.lhero{display:flex;gap:18px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.lhero h2{font:900 30px/1 var(--font);letter-spacing:.5px;background:linear-gradient(180deg,#fff,#c4a1ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lhero .sub{color:var(--mu);font-size:12.5px;max-width:560px}
+.lring{width:64px;height:64px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;
+ background:conic-gradient(#a67bff calc(var(--p)*1%),rgba(255,255,255,.07) 0);box-shadow:0 0 26px rgba(139,92,246,.35)}
+.lring b{width:52px;height:52px;border-radius:50%;background:#0b0812;display:grid;place-items:center;font-size:13px}
+.lvls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.labgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
+.lab{cursor:pointer;display:flex;flex-direction:column;gap:9px;animation:rise .5s var(--ease) both;animation-delay:calc(var(--i)*35ms);min-height:178px}
+.lab:hover{transform:translateY(-4px);border-color:rgba(196,160,255,.4);box-shadow:var(--bevel),var(--lift),0 0 34px rgba(139,92,246,.28)}
+.lab .lt{display:flex;gap:11px;align-items:center}
+.lab .li{width:42px;height:42px;border-radius:14px;display:grid;place-items:center;font-size:18px;font-weight:800;color:#fff;flex-shrink:0;
+ background:linear-gradient(160deg,var(--lc),rgba(0,0,0,.35));box-shadow:var(--bevel),0 0 18px color-mix(in srgb,var(--lc) 55%,transparent)}
+.lab .ln{font-weight:800;font-size:14.5px;line-height:1.25}.lab .lb{font-size:11.5px;color:var(--mu2)}
+.lab .ld{font-size:12px;color:var(--mu);line-height:1.45;flex:1;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.lab .lf{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.lab.done{border-color:rgba(52,211,153,.35)}.lab.done .li{box-shadow:var(--bevel),0 0 22px rgba(52,211,153,.5)}
+.dots{display:inline-flex;gap:3px;align-items:center}.dots i{width:7px;height:7px;border-radius:50%;background:rgba(255,255,255,.12)}
+.dots i.on{background:var(--dc);box-shadow:0 0 8px var(--dc)}
+.lvname{font-size:10.5px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:var(--dc)}
+.ok-badge{font-size:11px;font-weight:800;color:var(--ok)}
+.labview{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:16px;align-items:start}
+.lbrief{display:flex;flex-direction:column;gap:11px;position:sticky;top:0}
+.lbrief h3{font-size:20px;line-height:1.2}
+.goal{font-size:12.5px;padding:11px 13px;border-radius:14px;border:1px solid rgba(196,160,255,.3);background:rgba(139,92,246,.1)}
+.lhint{font-size:12.5px;color:var(--tx);line-height:1.5}
+.hintb{display:block;width:100%;text-align:left;margin-top:6px}
+.hintt{font-size:12.5px;padding:9px 12px;border-radius:12px;background:rgba(0,0,0,.35);border:1px solid var(--edge);margin-top:6px;white-space:pre-wrap;word-break:break-word;font-family:"JetBrains Mono",Consolas,monospace}
+.lsol{border-color:rgba(251,191,36,.35)}.lfix{border-color:rgba(52,211,153,.35);color:#d1fae5}
+.browser{padding:0;overflow:hidden;display:flex;flex-direction:column}
+.bbar{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--edge);background:rgba(0,0,0,.25)}
+.bdots{display:flex;gap:6px}.bdots i{width:11px;height:11px;border-radius:50%;background:#ff5f57}.bdots i:nth-child(2){background:#febc2e}.bdots i:nth-child(3){background:#28c840}
+.bbar input{border-radius:99px;padding:8px 14px;font:12.5px "JetBrains Mono",Consolas,monospace}
+.bbar .ghost{padding:7px 11px}
+.bframe{width:100%;height:calc(100vh - 320px);min-height:440px;border:0;background:#fff;display:block}
+.xpl{display:flex;flex-direction:column;gap:8px}
+.xpl textarea{min-height:110px;font:12px "JetBrains Mono",Consolas,monospace}
+.win{position:relative;overflow:hidden;border-color:rgba(52,211,153,.55)!important;box-shadow:var(--bevel),0 0 40px rgba(52,211,153,.35)!important;animation:pop .5s var(--spring)}
+.win h3{color:#6ee7b7}
+@media(max-width:820px){.labview{grid-template-columns:1fr}.lbrief{position:static}.bframe{height:62vh;min-height:360px}.lhero h2{font-size:24px}}
 /* ---------- экран входа и регистрации ---------- */
 #auth{position:fixed;inset:0;z-index:90;display:grid;place-items:center;overflow:auto;padding:28px 16px;background:#030205}
 #auth .bg,#auth .liquid{position:absolute}
@@ -1297,6 +1400,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
   <button class="tab" data-t="radar">IP-радар</button>
   <button class="tab" data-t="leaks">Утечки</button>
   <button class="tab" data-t="tools">Инструменты</button>
+  <button class="tab" data-t="labs">🧪 XSS-лаб</button>
   <button class="tab" data-t="audit">Аудит</button>
   <span id="ink"></span>
  </div>
@@ -1319,6 +1423,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
    <div class="tgrid" id="tgrid"></div>
   </div>
   <div class="panel" id="p-audit"><div class="tl" id="tl"></div></div>
+  <div class="panel" id="p-labs"></div>
   <div class="panel" id="p-globe"><canvas id="gcv"></canvas>
    <div class="ghud card">
     <div class="gtitle">◉ ГЛОБУС <span id="gclock"></span></div>
@@ -1376,7 +1481,7 @@ function num(el,to){const f=+el.dataset.v||0;el.dataset.v=to;const t0=performanc
 function moveInk(){const b=$(".tab.on"),k=$("#ink");if(!b)return;k.style.width=b.offsetWidth+"px";k.style.transform="translateX("+(b.offsetLeft-28)+"px)"}
 function setTab(t){tab=t;$$(".tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
  $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(sizeCv,30);if(t==="time")renderTimeline();
- if(t==="globe")setTimeout(globeOpen,30)}
+ if(t==="globe")setTimeout(globeOpen,30);if(t==="labs")labsOpen()}
 $$(".tab").forEach(b=>b.onclick=()=>setTab(b.dataset.t));
 
 function renderCases(){$("#cases").innerHTML=cases.map((c,i)=>`<div class="case ${cur&&cur.id===c.id?"on":""}" data-id="${c.id}" style="animation-delay:${i*40}ms">${esc(c.name)}</div>`).join("")||'<div class="mu" style="padding:8px;color:var(--mu2)">Создайте первый кейс ↓</div>'}
@@ -2355,6 +2460,72 @@ function bindAccount(b){b.querySelector("#sout").onclick=logout;b.querySelector(
      T=PAGE_T;ME=null;cases=[];cur=null;st=null;closeModal();render&&render();renderCases();
      toast(r.left&&r.left.length?"Аккаунт удалён. Не удалось стереть: "+r.left.join(", "):"Аккаунт и все данные удалены","ok");showAuth()}
     catch(x){m.querySelector("#derr").textContent=x.message}finally{e.target.classList.remove("loading")}}}}}
+
+/* =================== 2.3: XSS-ЛАБОРАТОРИЯ =================== */
+const LVC={1:"#34d399",2:"#22d3ee",3:"#a78bfa",4:"#fb923c",5:"#f43f5e"};
+let LAB=null,labLvl=0,labCur=null,labNav="";
+const dots=l=>`<span class="dots" style="--dc:${LVC[l]}">${[1,2,3,4,5].map(i=>`<i class="${i<=l?"on":""}"></i>`).join("")}</span>`;
+async function labsOpen(){try{LAB=await api("labs")}catch(x){$("#p-labs").innerHTML=`<div class="empty"><b>Лаборатория недоступна</b>${esc(x.message)}</div>`;return}
+ labCur?labOpen(labCur.id):labsGrid()}
+function labsGrid(){labCur=null;const L=LAB.labs,sol=LAB.progress.solved,n=Object.keys(sol).length,pc=Math.round(n/L.length*100);
+ $("#p-labs").innerHTML=`<div class="lhero"><div class="lring" style="--p:${pc}"><b>${n}/${L.length}</b></div>
+  <div><h2>XSS-ЛАБОРАТОРИЯ</h2><div class="sub">14 намеренно уязвимых сайтов: от отражённой XSS до обхода CSP, побега из песочницы шаблонов и DOM clobbering.
+  Цель в каждой — выполнить <code>alert()</code>, <code>confirm()</code>, <code>prompt()</code> или <code>print()</code> в контексте сайта.
+  Лабы работают на отдельном локальном сервере в изолированной песочнице — они не могут навредить Provenio и вашим данным.</div></div></div>
+  <div class="lvls"><span class="fc ${!labLvl?"on":""}" data-lv="0">Все уровни</span>${Object.keys(LAB.levels).map(k=>`<span class="fc ${labLvl==k?"on":""}" data-lv="${k}">${dots(+k)} ${esc(LAB.levels[k])}</span>`).join("")}</div>
+  <div class="labgrid">${L.filter(l=>!labLvl||l.level==labLvl).map((l,i)=>`<div class="card lab ${sol[l.id]?"done":""}" data-lab="${l.id}" style="--i:${i};--lc:${l.color}">
+   <div class="lt"><div class="li">${esc(l.icon)}</div><div><div class="ln">${l.id}. ${esc(l.title)}</div><div class="lb">${esc(l.brand)} · ${esc(l.ctx)}</div></div></div>
+   <div class="ld">${esc(l.story)}</div>
+   <div class="lf"><span style="--dc:${LVC[l.level]}" class="row" ><span class="lvname">${esc(l.level_name)}</span>${dots(l.level)}</span>
+    ${sol[l.id]?`<span class="ok-badge">✓ решено</span>`:(LAB.progress.revealed.includes(l.id)?`<span class="mu" style="font-size:11px">решение открыто</span>`:"")}</div></div>`).join("")}</div>`;
+ $("#p-labs").onclick=e=>{const f=e.target.closest("[data-lv]");if(f){labLvl=+f.dataset.lv;labsGrid();return}
+  const c=e.target.closest("[data-lab]");if(c)labOpen(+c.dataset.lab)}}
+function labOrigin(){return `http://127.0.0.1:${LAB.port}`}
+function labGo(path){const fr=$("#lframe");if(!fr)return;if(!path.startsWith("/"))path="/"+path;labNav=path;$("#laddr").value=path;fr.src=labOrigin()+path}
+function labOpen(id){const l=LAB.labs.find(x=>x.id===id);labCur=l;const pr=LAB.progress,solved=pr.solved[id],h=pr.hints[id]||0;
+ $("#p-labs").innerHTML=`<div class="row" style="margin-bottom:12px"><button class="ghost" id="lback">← Все лабы</button>
+  <span class="lvname" style="--dc:${LVC[l.level]}">${esc(l.level_name)}</span>${dots(l.level)}<span class="mu" style="font-size:12px">${esc(l.ctx)}</span></div>
+ <div class="labview"><div class="lbrief">
+  <div class="card ${solved?"win":""}" id="lcard"><h3>${l.id}. ${esc(l.title)}</h3><div class="pmsg" style="margin-bottom:8px">${esc(l.brand)}</div>
+   <div style="font-size:13px;line-height:1.55">${esc(l.story)}</div>
+   <div class="goal" style="margin-top:10px">🎯 <b>Цель:</b> выполнить <code>alert()</code> / <code>confirm()</code> / <code>prompt()</code> / <code>print()</code> на этом сайте${l.exploit?" — атакуя жертву со своего exploit-сервера":""}.</div>
+   <div id="lstat" class="pmsg" style="margin-top:8px">${solved?"✓ Решено "+esc(solved.ts):"Меняйте адрес и формы во встроенном браузере справа."}</div></div>
+  <div class="card"><b style="font-size:13px">💡 Подсказки</b>${l.hints.map((t,i)=>i<h?`<div class="hintt">${esc(t)}</div>`:`<button class="ghost hintb" data-h="${i+1}" ${i>h?"disabled style='opacity:.45'":""}>Подсказка ${i+1}</button>`).join("")}
+   <div class="row" style="margin-top:10px;gap:7px"><button class="ghost" id="lsolb">🔓 Показать решение</button><button class="ghost" id="lreset" title="Сбросить состояние сайта">↺ Сброс</button></div>
+   <div id="lsol"></div></div>
+  <div id="lfixc">${solved&&LAB.fixes[id]?`<div class="card lfix"><b>🛠 Как исправить</b><div class="lhint" style="margin-top:6px">${esc(LAB.fixes[id])}</div></div>`:""}</div>
+ </div>
+ <div class="flexcol" style="display:flex;flex-direction:column;gap:12px">
+  <div class="card browser"><div class="bbar"><span class="bdots"><i></i><i></i><i></i></span>
+   <input id="laddr" spellcheck="false" autocomplete="off"><button class="ghost" id="lgo" title="Перейти">→</button><button class="ghost" id="lreload" title="Обновить">⟳</button></div>
+   <iframe id="lframe" class="bframe" sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer"></iframe></div>
+  ${l.exploit?`<div class="card xpl"><b>🧨 Exploit-сервер</b><div class="pmsg">Ваша страница-ловушка. «Доставить жертве» откроет её в браузере жертвы — справа.</div>
+   <textarea id="lx" spellcheck="false" placeholder="<iframe src=&quot;/lab/${l.id}/&quot; onload=&quot;…&quot;></iframe>"></textarea>
+   <div class="row"><button class="btn" id="lxgo">Доставить жертве</button><button class="ghost" id="lxsite">Открыть сайт</button></div></div>`:""}
+ </div></div>`;
+ labGo(`/lab/${id}/`);
+ const P=$("#p-labs");P.onclick=async e=>{const t=e.target;
+  if(t.id==="lback"){labsGrid();return}
+  if(t.dataset.h){await api("labs_hint",{id,n:+t.dataset.h});LAB.progress.hints[id]=+t.dataset.h;labOpen(id);labGo(labNav);return}
+  if(t.id==="lsolb"){if(!confirm("Показать готовое решение? Лаба будет отмечена как «решение открыто».")) return;
+   const r=await api("labs_reveal",{id});if(!LAB.progress.revealed.includes(id))LAB.progress.revealed.push(id);
+   $("#lsol").innerHTML=`<div class="hintt lsol">${esc(r.solution)}</div><div class="lhint" style="margin-top:8px"><b>Как исправить:</b> ${esc(r.fix)}</div>`;return}
+  if(t.id==="lreset"){await api("labs_reset",{id});labGo(`/lab/${id}/`);toast("Состояние сайта сброшено","ok");return}
+  if(t.id==="lgo")labGo($("#laddr").value.trim()||`/lab/${id}/`);
+  if(t.id==="lreload")labGo(labNav);
+  if(t.id==="lxsite")labGo(`/lab/${id}/`);
+  if(t.id==="lxgo"){try{await api("labs_exploit",{id,html:$("#lx").value});labGo(`/exploit/${id}`);toast("Ловушка доставлена жертве","ok")}catch(x){toast(x.message,"bad")}}};
+ $("#laddr").onkeydown=e=>{if(e.key==="Enter")labGo(e.target.value.trim())}}
+async function labWin(m){if(!LAB||!labCur||m.provenioLab!==labCur.id||m.k!==LAB.secret)return;
+ const id=labCur.id;if(LAB.progress.solved[id]){toast(`✓ ${m.fn}(${m.arg}) — уже решено`,"ok");return}
+ try{const r=await api("labs_solved",{id,k:m.k,fn:m.fn});LAB.progress.solved[id]={ts:"только что",fn:m.fn};LAB.fixes[id]=r.fix;
+  const c=$("#lcard");if(c){c.classList.add("win");$("#lstat").innerHTML=`🎉 <b style="color:#6ee7b7">Решено!</b> Ваш payload вызвал <code>${esc(m.fn)}(${esc(m.arg)})</code> на сайте ${esc(labCur.brand)}.`}
+  $("#lfixc").innerHTML=`<div class="card lfix"><b>🛠 Как исправить</b><div class="lhint" style="margin-top:6px">${esc(r.fix)}</div></div>`;
+  toast(`🎉 Лаба «${labCur.title}» решена! Всего: ${r.solved}/${LAB.labs.length}`,"ok")}catch(x){toast(x.message,"bad")}}
+window.addEventListener("message",e=>{const m=e.data;if(!m||typeof m!=="object"||!m.provenioLab)return;
+ const fr=$("#lframe");if(!fr||e.origin!=="null"&&e.origin!==labOrigin())return;
+ if(m.nav&&e.source===fr.contentWindow){labNav=m.nav;$("#laddr").value=m.nav;return}
+ if(m.fn)labWin(m)});
 $("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
 setInterval(async()=>{if(!ME)return;try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
 window.addEventListener("load",showAuth);

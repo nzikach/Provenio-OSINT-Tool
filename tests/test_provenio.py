@@ -389,6 +389,76 @@ class AuthTests(unittest.TestCase):
             T.configure({"keys": {}})
 
 
+class LabTests(unittest.TestCase):
+    """XSS-лаборатория: уязвимости на месте (иначе лабы нерешаемы), защита там, где задумана."""
+
+    def get(self, path, data=None):
+        import urllib.request
+        import urllib.parse
+        import provenio_labs as L
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        url = f"http://127.0.0.1:{L.ensure_server()}{path}"
+        try:
+            r = op.open(url, urllib.parse.urlencode(data).encode() if data else None)
+            return r.status, dict(r.headers), r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode()
+
+    def test_catalog(self):
+        import provenio_labs as L
+        self.assertEqual(len(L.LABS), 14)
+        self.assertEqual({l["level"] for l in L.LABS}, {1, 2, 3, 4, 5})
+        for lab in L.catalog():
+            self.assertNotIn("solution", lab)          # решение не уходит в интерфейс без запроса
+            self.assertEqual(len(lab["hints"]), 3)
+
+    def test_vulnerable_contexts(self):
+        from urllib.parse import quote as q
+        self.assertIn("<script>alert(1)</script>", self.get("/lab/1/?q=" + q("<script>alert(1)</script>"))[2])
+        self.assertIn('value="" onmouseover="alert(1)"', self.get("/lab/3/?q=" + q('" onmouseover="alert(1)'))[2])
+        self.assertIn("var query = '\\\\';alert(1)//'", self.get("/lab/5/?q=" + q("\\';alert(1)//"))[2])
+        self.assertIn('href="javascript:alert(1)"', self.get("/lab/6/?site=" + q("javajavascript:script:alert(1)"))[2])
+        self.assertIn("</script><script>alert(1)</script>", self.get("/lab/7/?user=" + q("</script><script>alert(1)</script>"))[2])
+        self.assertIn("&#x27;);alert(1);//", self.get("/lab/8/?q=" + q("');alert(1);//"))[2])
+
+    def test_defenses_that_must_hold(self):
+        from urllib.parse import quote as q
+        import provenio_labs as L
+        code, _, body = self.get("/lab/9/?q=" + q("<img src=x onerror=alert(1)>"))
+        self.assertEqual(code, 403)
+        self.assertIn("<details open ontoggle=print()>", self.get("/lab/9/?q=" + q("<details open ontoggle=print()>"))[2])
+        cleaned = L.sanitize10("<img src=x onerror=alert(1)><script>alert(1)</script><SCRIPT src=//x></SCRIPT>")
+        self.assertNotIn("onerror", cleaned)
+        self.assertNotIn("script", cleaned.lower())
+        self.assertIn("<svg/onload=alert(1)>", L.sanitize10("<svg/onload=alert(1)>"))
+        self.assertEqual(L.sanitize14('<a href="javascript:x" onclick="y" id="z">t</a><script>q</script>'), '<a id="z">t</a>q')
+        _, hdr, body = self.get("/lab/13/?id=x")
+        self.assertIn("script-src", hdr.get("Content-Security-Policy", ""))
+        self.assertEqual(self.get("/lab/13/api/user?callback=print")[2], 'print({"name":"guest","id":1})')
+        self.assertTrue(self.get("/lab/13/api/user?callback=" + q("alert(1);x"))[2].startswith("callback("))
+        self.assertIn(L.SECRET, self.get("/lab/1/")[2])          # ключ решения — только на страницах-жертвах
+        L.set_exploit(11, "<p>trap</p>")
+        self.assertNotIn(L.SECRET, self.get("/exploit/11")[2])
+        with self.assertRaises(ValueError):
+            L.set_exploit(1, "x")
+
+    def test_stored_and_reset(self):
+        import provenio_labs as L
+        self.get("/lab/2/", {"name": "<b>n</b>", "text": "<i>stored</i>"})
+        body = self.get("/lab/2/")[2]
+        self.assertIn("<i>stored</i>", body)
+        self.assertIn("&lt;b&gt;n&lt;/b&gt;", body)
+        L.reset(2)
+        self.assertNotIn("<i>stored</i>", self.get("/lab/2/")[2])
+
+    def test_lab_server_only_localhost(self):
+        import http.client
+        import provenio_labs as L
+        c = http.client.HTTPConnection("127.0.0.1", L.ensure_server())
+        c.request("GET", "/lab/1/", headers={"Host": "evil.example"})
+        self.assertEqual(c.getresponse().status, 403)
+
+
 class UITests(unittest.TestCase):
     def test_page_and_api(self):
         import threading
@@ -438,7 +508,14 @@ class UITests(unittest.TestCase):
             self.assertIn("att", state["sources"][0])
             self.assertEqual(len(call("playbooks")), len(X.PLAYBOOKS))
             self.assertIsInstance(call("intersections"), list)
-            for tab in ("p-globe", "p-radar", "p-leaks"):
+            labs = call("labs")
+            self.assertEqual(len(labs["labs"]), 14)
+            with self.assertRaises(urllib.error.HTTPError):    # без ключа со страницы-жертвы не засчитывается
+                call("labs_solved", {"id": 1, "k": "fake"})
+            self.assertTrue(call("labs_solved", {"id": 1, "k": labs["secret"], "fn": "alert"})["first"])
+            self.assertIn("1", call("labs")["progress"]["solved"])
+            self.assertIn("solution", call("labs_reveal", {"id": 3}))
+            for tab in ("p-globe", "p-radar", "p-leaks", "p-labs"):
                 self.assertIn(tab, page)
             world = direct.open(urllib.request.Request(base + "/static/world.json",
                                                        headers={"X-Token": tok["t"]})).read()

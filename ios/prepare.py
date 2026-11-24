@@ -14,7 +14,7 @@ APP = os.path.join(ROOT, "ios", "src", "provenio_app")
 ICONS = os.path.join(ROOT, "ios", "icons")
 
 MODULES = ["provenio.py", "provenio_tools.py", "provenio_osint.py", "provenio_plus.py", "provenio_ui.py",
-           "provenio_auth.py", "provenio_sites.json"]
+           "provenio_auth.py", "provenio_labs.py", "provenio_sites.json"]
 
 
 def copy_sources():
