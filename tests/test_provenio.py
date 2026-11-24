@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import sys
+import sqlite3
 import tempfile
 import unittest
 import zipfile
@@ -58,7 +59,7 @@ class CoreTests(unittest.TestCase):
         s.add_case("c1")
         s.audit("x", "y")
         self.assertTrue(s.verify_audit()[0])
-        s.db.execute("UPDATE audit SET detail='подмена' WHERE action='x'")
+        s.db.execute("UPDATE audit SET detail=? WHERE action=?", ("подмена", "x"))
         self.assertFalse(s.verify_audit()[0])
 
     def test_tool_result_evidence_and_verify(self):
@@ -103,6 +104,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(P.parse_date("20200101120000"), "2020-01-01 12:00")
         self.assertEqual(P.parse_date("Jan  5 12:00:00 2025 GMT"), "2025-01-05 12:00")
         self.assertIsNone(P.parse_date("не дата"))
+
+    def test_versions_match(self):
+        """Версия в exe (свойства файла), приложении для iPhone и в коде — одна."""
+        vi = open(os.path.join(ROOT, "assets", "version_info.txt"), encoding="utf-8").read()
+        self.assertIn(f"'{P.APP_VERSION}'", vi)
+        self.assertIn("(" + ", ".join(P.APP_VERSION.split(".")) + ", 0)", vi)
+        self.assertIn(f'version = "{P.APP_VERSION}"', open(os.path.join(ROOT, "ios", "pyproject.toml"), encoding="utf-8").read())
 
     def test_settings_roundtrip(self):
         P.save_settings({"proxy": "http://127.0.0.1:8080", "keys": {"shodan": "secret123"}})
@@ -269,6 +277,118 @@ class PlusTests(unittest.TestCase):
             self.assertIn(t, T.TOOLS)
 
 
+class SQLInjectionTests(unittest.TestCase):
+    PAYLOADS = ["x'); DROP TABLE cases;--", "' OR '1'='1", "1 UNION SELECT name, sql FROM sqlite_master--",
+                "'; ATTACH DATABASE 'evil.db' AS e;--", "1; SELECT load_extension('x')", "\" OR \"\"=\"",
+                "admin'/*", "1 AND (SELECT 1 FROM (SELECT SLEEP(5)))", "%' AND 1=1 AND '%'='"]
+
+    def test_payloads_stored_as_plain_data(self):
+        s = new_store()
+        for p in self.PAYLOADS:
+            cid = s.add_case(p)
+            self.assertEqual(s.case(cid)["name"], p)          # сохранено буквально, не выполнено
+            s.add_tool_result(cid, "ioc", p, {"text": p, "iocs": {"domain": ["evil.com"]}})
+        self.assertTrue(set(self.PAYLOADS) <= {c["name"] for c in s.cases()})
+        self.assertTrue(s.verify_audit()[0])                  # таблицы на месте, журнал цел
+
+    def test_guard_rejects_unsafe_sql(self):
+        s = new_store()
+        bad = ["SELECT * FROM cases WHERE name='x'",            # строковый литерал
+               "SELECT * FROM cases WHERE id=1; DROP TABLE cases",   # stacked query
+               "SELECT * FROM cases -- comment", "SELECT /* c */ 1",
+               "ATTACH DATABASE ? AS e", "PRAGMA writable_schema=1",
+               'SELECT * FROM cases WHERE name="x"']
+        for q in bad:
+            with self.assertRaises(sqlite3.Error, msg=q):
+                s.db.execute(q, ("x",) if "?" in q else ())
+        with self.assertRaises(P.SQLInjectionError):      # число параметров не совпадает
+            s.db.execute("SELECT * FROM cases WHERE id=?", ())
+        with self.assertRaises(P.SQLInjectionError):      # подмена типа параметра
+            s.db.execute("SELECT * FROM cases WHERE id=?", ([1],))
+        with self.assertRaises(sqlite3.Error):            # авторизатор SQLite: DROP запрещён
+            s.db.execute("DROP TABLE cases")
+        with self.assertRaises(sqlite3.Error):
+            s.db.execute("SELECT load_extension(?)", ("evil",))
+        with self.assertRaises(sqlite3.Error):
+            s.db.executescript("DELETE FROM cases")
+        self.assertIsInstance(s.cases(), list)              # база цела
+
+    def test_ui_ids_must_be_integers(self):
+        import provenio_ui as U
+        for bad in ("1 OR 1=1", "1;DROP TABLE cases", "' OR ''='"):
+            with self.assertRaises(ValueError):
+                U.api("state", {"case": [bad]}, {})
+
+
+class AuthTests(unittest.TestCase):
+    def acc(self):
+        import provenio_auth as A
+        return A, A.Accounts(os.path.join(tempfile.mkdtemp(prefix="pv_acc_"), "account.json"))
+
+    def test_register_login_and_hash(self):
+        A, acc = self.acc()
+        self.assertFalse(acc.exists())
+        acc.register("analyst_1", "Str0ng-pass!", "Str0ng-pass!", "1990-05-01", True, True)
+        raw = open(acc.path, encoding="utf-8").read()
+        self.assertNotIn("Str0ng-pass!", raw)          # пароль не хранится
+        self.assertNotIn("1990", raw)                  # дата рождения не хранится
+        self.assertIn("scrypt", raw)
+        self.assertEqual(acc.login("ANALYST_1", "Str0ng-pass!")["username"], "analyst_1")
+        with self.assertRaises(A.AuthError):
+            acc.login("analyst_1", "wrong-password")
+        with self.assertRaises(A.AuthError):         # второй аккаунт в той же папке не создаётся
+            acc.register("other", "Str0ng-pass!", "Str0ng-pass!", "1990-05-01", True, True)
+
+    def test_registration_rules(self):
+        import datetime as dt
+        A, acc = self.acc()
+        young = (dt.date.today() - dt.timedelta(days=365 * 17)).isoformat()
+        cases = [("ab", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", True, True),        # короткое имя
+                 ("x' OR 1=1", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", True, True), # недопустимые символы
+                 ("user1", "short", "short", "1990-01-01", True, True),                   # слабый пароль
+                 ("user1", "password1", "password1", "1990-01-01", True, True),           # из словаря
+                 ("user1", "Str0ng-pass!", "Other-pass!", "1990-01-01", True, True),      # не совпадают
+                 ("user1", "Str0ng-pass!", "Str0ng-pass!", young, True, True),            # младше 18
+                 ("user1", "Str0ng-pass!", "Str0ng-pass!", "", True, True),               # нет даты
+                 ("user1", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", False, True),    # не принял условия
+                 ("user1", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", True, "yes")]    # согласие только явное
+        for c in cases:
+            with self.assertRaises(A.AuthError, msg=str(c)):
+                acc.register(*c)
+        self.assertFalse(acc.exists())
+        self.assertEqual(A.age_on("2000-06-15", dt.date(2018, 6, 14)), 17)
+        self.assertEqual(A.age_on("2000-06-15", dt.date(2018, 6, 15)), 18)
+
+    def test_lockout_and_password_change(self):
+        A, acc = self.acc()
+        acc.register("user1", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", True, True)
+        for _ in range(5):
+            with self.assertRaises(A.AuthError):
+                acc.login("user1", "bad")
+        with self.assertRaises(A.AuthError) as e:      # заблокировано даже с верным паролем
+            acc.login("user1", "Str0ng-pass!")
+        self.assertIn("Подождите", str(e.exception))
+        acc.locked_until = 0
+        acc.change_password("Str0ng-pass!", "N3w-secret-pw", "N3w-secret-pw")
+        self.assertTrue(acc.login("user1", "N3w-secret-pw"))
+
+    def test_wipe_data_dir(self):
+        import provenio_auth as A
+        d = tempfile.mkdtemp(prefix="pv_wipe_")
+        os.makedirs(os.path.join(d, "snapshots"))
+        for f in ("provenio.db", "settings.json", "account.json", "portable.txt", os.path.join("snapshots", "a.html")):
+            open(os.path.join(d, f), "w").close()
+        self.assertEqual(A.wipe_data_dir(d), [])
+        self.assertEqual(os.listdir(d), ["portable.txt"])
+
+    def test_redact_hides_keys(self):
+        T.configure({"keys": {"shodan": "SECRETKEY123456"}})
+        try:
+            self.assertNotIn("SECRETKEY123456", T.redact("HTTPError https://api.shodan.io/x?key=SECRETKEY123456"))
+        finally:
+            T.configure({"keys": {}})
+
+
 class UITests(unittest.TestCase):
     def test_page_and_api(self):
         import threading
@@ -285,11 +405,23 @@ class UITests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError):
                 direct.open(base + "/api/cases")             # без токена — 403
 
+            tok = {"t": U.TOKEN}
+
             def call(path, body=None):
-                req = urllib.request.Request(base + "/api/" + path, headers={"X-Token": U.TOKEN,
+                req = urllib.request.Request(base + "/api/" + path, headers={"X-Token": tok["t"],
                                              "Content-Type": "application/json"},
                                              data=json.dumps(body).encode() if body is not None else None)
                 return json.loads(direct.open(req).read())
+            # до входа токен страницы открывает только вход, регистрацию и документы
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                call("cases")
+            self.assertEqual(e.exception.code, 401)
+            self.assertIn("Условия", call("legal?doc=terms")["text"])
+            self.assertFalse(call("auth/status")["exists"])
+            reg = call("auth/register", {"username": "tester", "password": "Str0ng-pass!", "password2": "Str0ng-pass!",
+                                         "birth": "1990-01-01", "accept_terms": True, "accept_privacy": True})
+            tok["t"] = reg["token"]
+            self.assertNotEqual(reg["token"], U.TOKEN)
             cid = call("case", {"name": "ui-test"})["id"]
             jid = call("job", {"name": "ioc", "q": "1.2.3.4 evil[.]com"})["id"]
             import time
@@ -309,8 +441,26 @@ class UITests(unittest.TestCase):
             for tab in ("p-globe", "p-radar", "p-leaks"):
                 self.assertIn(tab, page)
             world = direct.open(urllib.request.Request(base + "/static/world.json",
-                                                       headers={"X-Token": U.TOKEN})).read()
+                                                       headers={"X-Token": tok["t"]})).read()
             self.assertIn(b"Topology", world)
+            for doc in ("privacy", "refund", "thirdparty"):
+                self.assertTrue(call("legal?doc=" + doc)["text"])
+            # выход: старый токен сеанса больше не работает
+            call("auth/logout", {})
+            with self.assertRaises(urllib.error.HTTPError):
+                call("cases")
+            tok["t"] = U.TOKEN
+            with self.assertRaises(urllib.error.HTTPError):
+                call("auth/login", {"username": "tester", "password": "nope"})
+            tok["t"] = call("auth/login", {"username": "tester", "password": "Str0ng-pass!"})["token"]
+            self.assertIn("ui-test", [c["name"] for c in call("cases")])
+            # удаление аккаунта: нужен пароль и слово УДАЛИТЬ, после — пусто
+            with self.assertRaises(urllib.error.HTTPError):
+                call("auth/delete", {"password": "Str0ng-pass!", "confirm": "нет"})
+            self.assertTrue(call("auth/delete", {"password": "Str0ng-pass!", "confirm": "УДАЛИТЬ"})["deleted"])
+            tok["t"] = U.TOKEN
+            self.assertFalse(call("auth/status")["exists"])
+            self.assertFalse(os.path.exists(os.path.join(P.DATA_DIR, "provenio.db")) and U.S.cases())
         finally:
             srv.shutdown()
 

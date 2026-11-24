@@ -60,6 +60,16 @@ def key(name):
     return ((SETTINGS.get("keys") or {}).get(name) or "").strip()
 
 
+def redact(text):
+    """Убирает значения ключей API из текста (ошибки с URL вида ?key=..., журналы, ответы интерфейсу)."""
+    s = str(text)
+    for v in (SETTINGS.get("keys") or {}).values():
+        v = str(v or "").strip()
+        if len(v) >= 6 and v in s:
+            s = s.replace(v, "•••скрыто•••")
+    return s
+
+
 # ----------------------------------------------------------------- задачи с прогрессом
 class Cancelled(Exception):
     pass

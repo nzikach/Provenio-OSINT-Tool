@@ -1,7 +1,8 @@
-name: Build Provenio.exe
+name: Build Provenio for Windows
 
-# Сборка на каждый push в main (exe доступен в Artifacts запуска)
-# и выпуск релиза с exe при пуше тега вида v2.0.0.
+# На каждый push в main — сборка (файлы в Artifacts запуска).
+# При пуше тега вида v2.2.0 — релиз: установщик Provenio-Setup-<версия>.exe,
+# портативный Provenio-<версия>-portable.exe и SHA256SUMS.txt.
 on:
   push:
     branches: [main]
@@ -21,6 +22,17 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Version
+        id: ver
+        shell: python
+        run: |
+          import os, re
+          v = re.search(r'APP_VERSION = "([^"]+)"', open("provenio.py", encoding="utf-8").read()).group(1)
+          ref = os.environ.get("GITHUB_REF", "")
+          if ref.startswith("refs/tags/v") and ref[11:] != v:
+              raise SystemExit(f"Тег {ref[10:]} не совпадает с APP_VERSION {v}")
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"v={v}\n")
+
       - name: Create venv
         run: python -m venv .venv
 
@@ -28,24 +40,43 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -SourceBootloader
 
-      - name: SHA-256
+      - name: Audit third-party packages (pip-audit)
         shell: powershell
         run: |
-          $h = (Get-FileHash dist\Provenio.exe -Algorithm SHA256).Hash
-          "$h  Provenio.exe" | Out-File -Encoding ascii dist\Provenio.exe.sha256
+          .venv\Scripts\python -m pip install --quiet pip-audit
+          .venv\Scripts\python -m pip_audit -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip-audit нашёл уязвимые зависимости" }
+
+      - name: Installer (Inno Setup)
+        shell: powershell
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup не найден" }
+          Get-Content -Encoding UTF8 legal\TERMS.md | Set-Content -Encoding UTF8 installer\TERMS.txt
+          & $iscc /Qp "/DAppVersion=${{ steps.ver.outputs.v }}" installer\Provenio.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC завершился с ошибкой" }
+
+      - name: Versioned files + SHA-256
+        shell: powershell
+        run: |
+          $v = "${{ steps.ver.outputs.v }}"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item dist\Provenio.exe "out\Provenio-$v-portable.exe"
+          Copy-Item "installer\Output\Provenio-Setup-$v.exe" "out\Provenio-Setup-$v.exe"
+          Get-ChildItem out\*.exe | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Out-File -Encoding ascii out\SHA256SUMS.txt
+          Get-Content out\SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Provenio-exe
-          path: |
-            dist/Provenio.exe
-            dist/Provenio.exe.sha256
+          name: Provenio-${{ steps.ver.outputs.v }}-windows
+          path: out/*
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/Provenio.exe
-            dist/Provenio.exe.sha256
+          files: out/*
           generate_release_notes: true

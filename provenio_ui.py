@@ -25,10 +25,14 @@ import provenio as P
 import provenio_tools as TL
 import provenio_osint  # noqa: F401  (регистрирует новые инструменты в TL.TOOLS)
 import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, глобус, сценарии, ИИ-сводка
+import provenio_auth as A   # 2.2: локальная учётная запись
 
 S = P.Store()
 LOCK = S.lock
-TOKEN = secrets.token_urlsafe(24)
+TOKEN = secrets.token_urlsafe(24)       # токен страницы: до входа открывает только вход/регистрацию и документы
+SESSION = {"tok": None, "user": None}    # токен сеанса после входа: нужен для всех остальных запросов
+ACC = A.Accounts(os.path.join(P.DATA_DIR, "account.json"))
+LEGAL_DOCS = {"terms": "TERMS.md", "privacy": "PRIVACY.md", "refund": "REFUND.md", "thirdparty": "THIRD_PARTY.md"}
 TL.configure(P.load_settings())
 JOBS = {}
 BLOBS = {}
@@ -256,7 +260,8 @@ def save_job(rec, case_id, pivot=None):
         raise ValueError("Результаты этой задачи уже сохранены в кейс")
     q = rec["q"] if rec["name"] not in ("file_meta", "evidence_verify") else \
         (rec["result"] or {}).get("name") or rec["q"] or "файл"
-    sid, n = S.add_tool_result(case_id, rec["name"], q, rec["result"],
+    result = json.loads(TL.redact(json.dumps(rec["result"], ensure_ascii=False, default=str)))
+    sid, n = S.add_tool_result(case_id, rec["name"], q, result,
                                pivot=tuple(pivot) if pivot else None)
     rec["saved"] = {"source": sid, "entities": n}
     return rec["saved"]
@@ -287,6 +292,75 @@ def monitor_loop():
         if time.time() - last_brand > 120:
             last_brand = time.time()
             threading.Thread(target=brand_loop_once, daemon=True).start()
+
+
+# ----------------------------------------------------------------- учётная запись
+def legal_doc(name):
+    fn = LEGAL_DOCS.get(str(name))
+    if not fn:
+        raise KeyError("Нет такого документа")
+    with open(TL.res_path(os.path.join("legal", fn)), encoding="utf-8") as f:
+        return {"name": name, "text": f.read()}
+
+
+def new_session(user):
+    SESSION["tok"] = secrets.token_urlsafe(32)
+    SESSION["user"] = user["username"]
+    return {"token": SESSION["tok"], "user": user}
+
+
+def auth_api(path, body, logged_in):
+    """Запросы, доступные до входа (с токеном страницы)."""
+    if path == "auth/status":
+        return {**ACC.public(), "logged_in": logged_in, "platform": PLATFORM}
+    if path == "auth/register":
+        user = ACC.register(body.get("username"), body.get("password"), body.get("password2"), body.get("birth"),
+                            body.get("accept_terms"), body.get("accept_privacy"))
+        cur = P.load_settings()
+        cur["check_updates"] = body.get("check_updates") is True   # только по явному согласию
+        TL.configure(P.save_settings(cur))
+        S.audit("account_created", f"user={user['username']} terms={A.TERMS_VERSION} age_verified=18+")
+        return new_session(user)
+    if path == "auth/login":
+        user = ACC.login(body.get("username"), body.get("password"))
+        S.audit("login", f"user={user['username']}")
+        return new_session(user)
+    if path == "legal":
+        return legal_doc(body.get("doc"))
+    raise KeyError(path)
+
+
+def account_api(path, body):
+    """Запросы, доступные только после входа."""
+    global S, LOCK
+    if path == "auth/logout":
+        S.audit("logout", f"user={SESSION['user']}")
+        SESSION["tok"] = SESSION["user"] = None
+        return {}
+    if path == "auth/password":
+        ACC.change_password(body.get("old"), body.get("new"), body.get("new2"))
+        S.audit("password_changed", f"user={SESSION['user']}")
+        return {"message": "Пароль изменён"}
+    if path == "auth/accept_terms":
+        ACC.accept_terms()
+        return ACC.public()
+    if path == "auth/delete":
+        ACC.check_password(body.get("password"))
+        if str(body.get("confirm", "")).strip().upper() not in ("УДАЛИТЬ", "DELETE"):
+            raise ValueError("Введите слово УДАЛИТЬ для подтверждения")
+        for rec in JOBS.values():
+            rec["job"].cancelled = True
+        with LOCK:
+            S.db.close()
+            failed = A.wipe_data_dir(P.DATA_DIR)
+            S = P.Store(P.DB_PATH, P.SNAP_DIR)   # пустая база; старые данные 1.x повторно не импортируются
+            LOCK = S.lock
+        JOBS.clear()
+        BLOBS.clear()
+        TL.configure(P.load_settings())
+        SESSION["tok"] = SESSION["user"] = None
+        return {"deleted": True, "left": failed}
+    raise KeyError(path)
 
 
 # ----------------------------------------------------------------- настройки
@@ -547,6 +621,8 @@ class Handler(BaseHTTPRequestHandler):
         if ctype.startswith("application/json") and not isinstance(body, (bytes, str)):
             body = json.dumps(body, ensure_ascii=False, default=str)
         if isinstance(body, str):
+            if not ctype.startswith("text/html"):
+                body = TL.redact(body)
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -558,9 +634,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def token(self, q):
+        return self.headers.get("X-Token") or (q.get("t") or [""])[0]
+
     def authorized(self, q):
-        tok = self.headers.get("X-Token") or (q.get("t") or [""])[0]
-        return self.host_ok() and secrets.compare_digest(tok, TOKEN)
+        """Только после входа: токен сеанса, выданный при входе/регистрации."""
+        tok, cur = self.token(q), SESSION["tok"]
+        return self.host_ok() and bool(cur) and secrets.compare_digest(tok, cur)
+
+    def page_token_ok(self, q):
+        return self.host_ok() and (secrets.compare_digest(self.token(q), TOKEN) or self.authorized(q))
 
     def host_ok(self):
         return self.headers.get("Host", "").split(":")[0] in ("127.0.0.1", "localhost")
@@ -582,8 +665,24 @@ class Handler(BaseHTTPRequestHandler):
                     return self.out(403, "forbidden", "text/plain")
                 return self.out(200, PAGE.replace("__TOKEN__", TOKEN).replace("__VER__", P.APP_VERSION)
                                 .replace("__PLAT__", PLATFORM), "text/html; charset=utf-8")
+            if u.path in ("/api/auth/status", "/api/auth/register", "/api/auth/login", "/api/legal"):
+                if not self.page_token_ok(q):
+                    return self.out(403, {"error": "forbidden"})
+                body = self.read_body(method)
+                if u.path == "/api/legal" and not body:
+                    body = {"doc": (q.get("doc") or [""])[0]}
+                try:
+                    return self.out(200, auth_api(u.path[5:], body, self.authorized(q)))
+                except (KeyError, ValueError) as e:
+                    return self.out(400, {"error": str(e).strip("'")})
             if not self.authorized(q):
-                return self.out(403, {"error": "forbidden"})
+                return self.out(401 if self.page_token_ok(q) else 403,
+                                {"error": "Войдите в аккаунт" if self.page_token_ok(q) else "forbidden"})
+            if u.path.startswith("/api/auth/"):
+                try:
+                    return self.out(200, account_api(u.path[5:], self.read_body(method)))
+                except (KeyError, ValueError) as e:
+                    return self.out(400, {"error": str(e).strip("'")})
             if u.path == "/api/tool":   # совместимость с 1.x: синхронный вызов
                 body = self.read_body(method)
                 try:
@@ -621,7 +720,7 @@ class Handler(BaseHTTPRequestHandler):
             self.out(404, {"error": "not found"})
         except Exception as e:
             traceback.print_exc()
-            self.out(500, {"error": f"{type(e).__name__}: {e}"})
+            self.out(500, {"error": TL.redact(f"{type(e).__name__}: {e}")})
 
     def do_GET(self):
         self.handle_any("GET")
@@ -985,6 +1084,129 @@ table.t th{color:var(--ac2);font-weight:600}
 .pb b{display:block}.pb small{color:var(--mu);font-size:11px}
 .ent{cursor:pointer}
 #cv,#gcv{touch-action:none}
+/* ---------- 2.2: «жидкое стекло» — чёрный, фиолетовое свечение, объёмные стеклянные плитки ---------- */
+:root{
+ --bg:#030205; --bg2:#08060d; --panel:rgba(14,10,22,.42);
+ --g1:rgba(255,255,255,.075); --g2:rgba(255,255,255,.018);
+ --edge:rgba(255,255,255,.09); --bd:rgba(255,255,255,.09); --bd2:rgba(196,160,255,.38);
+ --tx:#f1edf9; --mu:#a49cbd; --mu2:#6f6789;
+ --ac:#8b5cf6; --ac2:#c4a1ff; --ac3:#7c3aed; --mag:#d946ef; --blu:#6366f1;
+ --violet:linear-gradient(180deg,#a67bff 0%,#7c3aed 58%,#6421d1 100%);
+ --bevel:inset 0 1px 0 rgba(255,255,255,.13),inset 0 -1px 0 rgba(0,0,0,.5),inset 0 0 0 1px rgba(255,255,255,.025);
+ --lift:0 22px 50px rgba(0,0,0,.6),0 2px 8px rgba(0,0,0,.45);
+ --glow:0 0 0 1px rgba(214,190,255,.5),0 0 22px rgba(139,92,246,.6),0 0 60px rgba(139,92,246,.22);
+ --font:"Segoe UI Variable Display","Segoe UI Variable Text","Segoe UI","Inter",system-ui,sans-serif;
+}
+body{font-family:var(--font)}
+.bg{background:radial-gradient(1000px 700px at 85% -15%,rgba(124,58,237,.30),transparent 60%),
+ radial-gradient(900px 700px at -15% 115%,rgba(192,38,211,.20),transparent 60%),
+ radial-gradient(700px 500px at 50% 50%,rgba(76,29,149,.10),transparent 70%),#030205}
+.mesh i{opacity:.1}
+.liquid{position:fixed;z-index:-1;pointer-events:none;mix-blend-mode:screen}
+.liquid i{position:absolute;inset:0;border-radius:42% 58% 63% 37%/45% 38% 62% 55%;filter:blur(3px) saturate(135%);
+ background:conic-gradient(from 200deg,#2e1065,#7c3aed,#c026d3,#f0abfc,#818cf8,#4c1d95,#2e1065);
+ animation:morph 19s ease-in-out infinite alternate,spinb 46s linear infinite}
+.liquid i::after{content:"";position:absolute;inset:0;border-radius:inherit;
+ background:radial-gradient(circle at 30% 24%,rgba(255,255,255,.55),transparent 30%),
+ radial-gradient(circle at 64% 72%,rgba(3,2,5,.9),transparent 52%),radial-gradient(circle at 80% 30%,rgba(99,102,241,.5),transparent 40%)}
+.liquid.a{width:34vw;height:34vw;right:-15vw;top:-19vw;opacity:.38}
+.liquid.b{width:26vw;height:26vw;left:-13vw;bottom:-15vw;opacity:.22}
+.liquid.b i{animation-direction:alternate-reverse,reverse}
+@keyframes morph{50%{border-radius:58% 42% 35% 65%/52% 61% 39% 48%}100%{border-radius:35% 65% 52% 48%/38% 45% 55% 62%}}
+@keyframes spinb{to{transform:rotate(360deg)}}
+
+aside{background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01)),rgba(6,5,10,.72);border-right:1px solid var(--edge);
+ box-shadow:inset -1px 0 0 rgba(255,255,255,.03)}
+aside::after{background:linear-gradient(180deg,transparent,rgba(196,160,255,.4),transparent)}
+.card{background:linear-gradient(160deg,var(--g1),var(--g2)),rgba(9,7,14,.62);border:1px solid var(--edge);border-radius:22px;box-shadow:var(--bevel),var(--lift)}
+.card::before{background:linear-gradient(140deg,rgba(255,255,255,.22),transparent 35%,transparent 70%,rgba(196,160,255,.12))}
+.stat:hover,.tool:hover,.src:hover{border-color:rgba(196,160,255,.32);box-shadow:var(--bevel),var(--lift),0 0 34px rgba(139,92,246,.22)}
+.stat b{background:linear-gradient(180deg,#fff 30%,#c4a1ff);-webkit-background-clip:text;background-clip:text;text-shadow:0 0 30px rgba(139,92,246,.35)}
+
+.logo b{border-radius:13px;background:var(--violet);box-shadow:var(--bevel),var(--glow);animation:none}
+.logo span{font-weight:800;letter-spacing:.6px;background:linear-gradient(180deg,#fff,#d8c5ff);-webkit-background-clip:text;background-clip:text}
+.user{display:flex;gap:10px;align-items:center;padding:10px 12px;border-radius:18px;border:1px solid var(--edge);
+ background:linear-gradient(160deg,var(--g1),var(--g2)),rgba(9,7,14,.5);box-shadow:var(--bevel)}
+.user .av{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:rgba(139,92,246,.22);
+ border:1px solid rgba(196,160,255,.3);font-weight:800;color:#e9ddff;text-transform:uppercase}
+.user b{display:block;font-size:13.5px;line-height:1.2}.user small{color:var(--mu2);font-size:11px}
+
+.case{border-radius:16px;padding:11px 14px}
+.case:hover{background:linear-gradient(160deg,var(--g1),var(--g2)),rgba(9,7,14,.5);border-color:var(--edge);box-shadow:var(--bevel)}
+.case.on{background:var(--violet);border-color:rgba(226,206,255,.55);box-shadow:var(--bevel),var(--glow);color:#fff;font-weight:700}
+.case.on::before{display:none}
+
+input,textarea,select{border-radius:16px;background:rgba(0,0,0,.38);border:1px solid var(--edge);
+ box-shadow:inset 0 2px 7px rgba(0,0,0,.5),inset 0 -1px 0 rgba(255,255,255,.04)}
+input:focus,textarea:focus,select:focus{border-color:rgba(196,160,255,.6);background:rgba(0,0,0,.45);
+ box-shadow:inset 0 2px 7px rgba(0,0,0,.5),0 0 0 3px rgba(139,92,246,.25),0 0 22px rgba(139,92,246,.25)}
+select option{background:#120d1d}
+#url{border-radius:99px;padding-left:44px;background:rgba(0,0,0,.38) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' fill='none' stroke='%23a49cbd' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='8' cy='8' r='6'/%3E%3Cpath d='m13 13 4 4'/%3E%3C/svg%3E") no-repeat 17px 50%}
+
+.btn,.tbtn{border-radius:99px;background:var(--violet);
+ box-shadow:inset 0 1px 0 rgba(255,255,255,.38),inset 0 -2px 0 rgba(0,0,0,.22),0 0 0 1px rgba(196,160,255,.45),0 10px 28px rgba(124,58,237,.45),0 0 44px rgba(139,92,246,.22)}
+.btn:hover,.tbtn:hover{box-shadow:inset 0 1px 0 rgba(255,255,255,.42),inset 0 -2px 0 rgba(0,0,0,.22),0 0 0 1px rgba(226,206,255,.7),0 14px 34px rgba(124,58,237,.6),0 0 60px rgba(139,92,246,.35)}
+.btn[disabled]{opacity:.45;pointer-events:none}
+.btn.danger,.ghost.danger{background:linear-gradient(180deg,#fb7185,#e11d48);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 0 0 1px rgba(253,164,175,.5),0 10px 26px rgba(225,29,72,.4);color:#fff;border:0}
+.ghost{border-radius:99px;background:linear-gradient(180deg,rgba(255,255,255,.075),rgba(255,255,255,.02)),rgba(9,7,14,.45);border:1px solid var(--edge);box-shadow:var(--bevel)}
+.ghost:hover{border-color:rgba(196,160,255,.45);background:linear-gradient(180deg,rgba(255,255,255,.1),rgba(255,255,255,.03));box-shadow:var(--bevel),0 0 20px rgba(139,92,246,.3)}
+.pill{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.015));box-shadow:var(--bevel)}
+
+.tabs{border-bottom:0;gap:8px;padding:6px 28px 2px;margin:6px 0 18px;flex-wrap:wrap}
+.tab{border-radius:99px;padding:9px 18px;border:1px solid var(--edge);color:var(--mu);
+ background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.015));box-shadow:var(--bevel);transition:all .3s var(--spring)}
+.tab:hover{color:#fff;transform:translateY(-1px);border-color:rgba(196,160,255,.35)}
+.tab.on{color:#fff;background:var(--violet);border-color:rgba(226,206,255,.6);box-shadow:var(--bevel),var(--glow)}
+#ink{display:none}
+
+.fc,.seg button{background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.015));border:1px solid var(--edge);box-shadow:var(--bevel)}
+.fc.on,.seg button.on,.pb.on{background:var(--violet);border-color:rgba(226,206,255,.6);color:#fff;box-shadow:var(--bevel),var(--glow)}
+.pb{border-radius:18px;background:linear-gradient(160deg,var(--g1),var(--g2));border:1px solid var(--edge);box-shadow:var(--bevel)}
+.tool .ic{border-radius:15px;background:linear-gradient(160deg,rgba(255,255,255,.1),rgba(255,255,255,.02));
+ border:1px solid var(--edge);box-shadow:var(--bevel),0 8px 20px rgba(0,0,0,.4);text-shadow:0 0 14px rgba(196,160,255,.8)}
+.tool:hover .ic{background:var(--violet);box-shadow:var(--bevel),var(--glow)}
+
+/* тумблеры вместо флажков (как переключатель на референсе) */
+input[type=checkbox]{appearance:none;-webkit-appearance:none;width:40px!important;min-width:40px;height:23px;padding:0;flex:0 0 40px;
+ border-radius:99px;position:relative;cursor:pointer;vertical-align:middle;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);
+ box-shadow:inset 0 2px 6px rgba(0,0,0,.65);transition:all .35s var(--spring)}
+input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+ background:linear-gradient(180deg,#e4dff0,#8c83a3);box-shadow:0 2px 5px rgba(0,0,0,.55);transition:all .4s var(--spring)}
+input[type=checkbox]:checked{background:linear-gradient(180deg,rgba(166,123,255,.7),rgba(100,33,209,.7));border-color:rgba(216,190,255,.6);
+ box-shadow:inset 0 1px 0 rgba(255,255,255,.22),0 0 18px rgba(139,92,246,.6)}
+input[type=checkbox]:checked::after{left:19px;background:radial-gradient(circle at 35% 30%,#fff,#efe4ff 40%,#c4a1ff);box-shadow:0 0 14px rgba(216,180,254,.95)}
+
+.modal{background:linear-gradient(165deg,rgba(34,25,54,.94),rgba(10,7,17,.96));border:1px solid rgba(255,255,255,.1);border-radius:26px;
+ box-shadow:var(--bevel),0 40px 100px rgba(0,0,0,.7),0 0 80px rgba(124,58,237,.18)}
+.menu,.toast{background:linear-gradient(165deg,rgba(34,25,54,.95),rgba(12,9,20,.97));border-color:rgba(255,255,255,.1);box-shadow:var(--bevel),var(--lift)}
+.menu{border-radius:18px}.toast{border-radius:16px}
+.ghud,.ginfo{background:linear-gradient(165deg,rgba(30,22,48,.72),rgba(10,7,17,.8))}
+.empty::before{content:"PROVENIO";display:block;font:900 clamp(40px,7vw,86px)/1 var(--font);letter-spacing:.12em;
+ color:transparent;-webkit-text-stroke:1px rgba(196,160,255,.32);margin-bottom:18px}
+.md a{color:var(--ac2)}.md pre{background:rgba(0,0,0,.4);border:1px solid var(--edge);border-radius:12px;padding:10px 12px;overflow:auto;font:12px Consolas,monospace}
+.md table{display:block;overflow-x:auto}
+
+/* ---------- экран входа и регистрации ---------- */
+#auth{position:fixed;inset:0;z-index:90;display:grid;place-items:center;overflow:auto;padding:28px 16px;background:#030205}
+#auth .bg,#auth .liquid{position:absolute}
+#auth .liquid.a{width:min(62vw,720px);height:min(62vw,720px);right:-10%;top:-18%;opacity:.7}
+#auth .liquid.b{width:min(44vw,520px);height:min(44vw,520px);left:-12%;bottom:-20%;opacity:.5}
+.ahero{position:absolute;left:5vw;bottom:5vh;font:900 clamp(56px,11vw,170px)/.9 var(--font);letter-spacing:.06em;color:transparent;
+ -webkit-text-stroke:1px rgba(196,160,255,.22);pointer-events:none;user-select:none}
+.abox{position:relative;width:min(450px,100%);padding:30px 30px 24px;display:flex;flex-direction:column;gap:12px;animation:pop .5s var(--spring)}
+.abox h2{font:800 27px/1.15 var(--font);letter-spacing:.3px}
+.abox h2 small{display:block;font:600 11px var(--font);letter-spacing:3px;text-transform:uppercase;color:var(--ac2);margin-bottom:8px}
+.abox .sub{color:var(--mu);font-size:13px;margin-top:-4px}
+label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;color:var(--mu);font-weight:600}
+.pw{position:relative}.pw input{padding-right:44px}
+.pw button{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--mu);cursor:pointer;font-size:15px;padding:4px 6px}
+.meter{height:5px;border-radius:9px;background:rgba(255,255,255,.07);overflow:hidden}.meter i{display:block;height:100%;width:0;transition:all .4s var(--ease)}
+.cons{display:flex;gap:11px;align-items:flex-start;font-size:12.5px;color:var(--tx);line-height:1.45;cursor:pointer}
+.cons a,.alink{color:var(--ac2);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.aerr{color:var(--bad);font-size:12.5px;min-height:18px}
+.afoot{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:var(--mu2);flex-wrap:wrap}
+.free{font-size:11.5px;color:var(--mu);padding:9px 12px;border-radius:14px;border:1px solid rgba(52,211,153,.25);background:rgba(52,211,153,.06)}
+.docs{display:flex;gap:7px;flex-wrap:wrap}
 @media(max-width:820px){
  body{display:block;height:auto;min-height:100vh;overflow:auto;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
  aside{flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px;border-right:0;border-bottom:1px solid var(--bd);
@@ -1018,15 +1240,23 @@ table.t th{color:var(--ac2);font-weight:600}
  #toasts{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom))}.toast{max-width:none}
  table.t{display:block;overflow-x:auto}
  .lhead .big{font-size:32px}
+ .tabs{flex-wrap:nowrap}.tab{padding:8px 14px}
+ .user{flex:1 1 100%;padding:8px 10px}
+ .abox{padding:22px 18px 18px}.ahero{display:none}
+ .liquid.a{width:80vw;height:80vw;right:-35vw;top:-35vw}
 }
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(168,130,255,.2);border-radius:9px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(168,130,255,.35)}
 </style></head><body>
-<div class="bg"></div><div class="mesh"><i></i><i></i><i></i></div><div class="grain"></div>
+<div class="bg"></div><div class="mesh"><i></i><i></i><i></i></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="grain"></div>
+<div id="auth"><div class="bg"></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="ahero">PROVENIO</div>
+ <div class="card abox" id="abox"><div class="hint">Загрузка…</div></div></div>
 <aside>
  <div class="logo"><b>◈</b><span>Provenio</span></div>
+ <div class="user" id="userbox"><div class="av" id="uav">?</div><div class="grow"><b id="uname">—</b><small>локальный аккаунт</small></div>
+  <button class="ghost" id="logout" title="Выйти из аккаунта" style="padding:7px 10px">⏻</button></div>
  <div class="cap">Кейсы</div>
  <div class="cases" id="cases"></div>
  <div class="newc"><input id="ncase" placeholder="Новый кейс"><button class="btn" id="addc">+</button></div>
@@ -1036,6 +1266,7 @@ table.t th{color:var(--ac2);font-weight:600}
   <button class="ghost" id="inter">🔀 Пересечения кейсов</button>
   <button class="ghost" id="brandb">🛡 Мониторинг бренда</button>
   <button class="ghost" id="ddir">📁 Папка данных</button>
+  <button class="ghost" id="docsb">📄 Условия и конфиденциальность</button>
   <a class="ghost upd" id="updb" target="_blank" rel="noopener" hidden></a>
   <span class="ver">Provenio __VER__</span>
  </div>
@@ -1128,14 +1359,16 @@ table.t th{color:var(--ac2);font-weight:600}
 </main>
 <div id="toasts"></div>
 <script>
-const PLAT="__PLAT__",IOS=PLAT==="ios",T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const PLAT="__PLAT__",IOS=PLAT==="ios",PAGE_T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const TY={email:"#fb923c",phone:"#34d399",domain:"#60a5fa",ip:"#c084fc",account:"#f87171",src:"#e5e7eb"};
 const TL={email:"Email",phone:"Телефон",domain:"Домен",ip:"IP",account:"Аккаунт"};
+let T=PAGE_T,ME=null,STARTED=false;
 let cases=[],cur=null,st=null,tab="src",ef="all",eq="";
 const host=u=>{try{return new URL(u).hostname.replace(/^www\./,"")}catch(e){return u}};
 async function api(p,b){const r=await fetch("/api/"+p,{method:b?"POST":"GET",headers:{"X-Token":T,"Content-Type":"application/json"},
- body:b?JSON.stringify(b):undefined});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
+ body:b?JSON.stringify(b):undefined});const j=await r.json();
+ if(r.status===401&&!p.startsWith("auth/")){showAuth();throw new Error("Войдите в аккаунт")}if(!r.ok)throw new Error(j.error||r.status);return j}
 function toast(m,k){const t=document.createElement("div");t.className="toast "+(k||"");t.textContent=m;$("#toasts").append(t);
  setTimeout(()=>{t.classList.add("out");setTimeout(()=>t.remove(),400)},3600)}
 function num(el,to){const f=+el.dataset.v||0;el.dataset.v=to;const t0=performance.now();
@@ -1693,7 +1926,8 @@ const KEYN={shodan:"Shodan",virustotal:"VirusTotal",abuseipdb:"AbuseIPDB",urlsca
 const chk=(id,on,t)=>`<label class="gl" style="color:var(--tx)"><input type="checkbox" id="${id}" ${on?"checked":""}> ${t}</label>`;
 async function openSettings(){const s=await api("settings"),i=await api("info");
  const b=modal("Настройки",`<div class="hint" style="margin-bottom:10px">Все ключи необязательны: без них работают бесплатные источники. Ключи хранятся только на этом компьютере,
-  зашифрованные средствами Windows (DPAPI) — их может расшифровать только ваша учётная запись.</div>
+  зашифрованные средствами Windows (DPAPI) — их может расшифровать только ваша учётная запись. Здесь видны только последние 4 символа,
+  а из ошибок, отчётов и сохранённых результатов ключи вырезаются. Платные сервисы вы оплачиваете им напрямую — Provenio ничего не берёт.</div>
   <div class="frow"><label>Прокси (HTTP/HTTPS)</label><input id="sproxy" placeholder="http://127.0.0.1:8080" value="${esc(s.proxy)}"></div>
   <div class="frow"><label>Таймаут запросов, с</label><input id="stime" type="number" min="5" max="120" value="${esc(s.timeout)}"></div>
   ${Object.keys(KEYN).map(k=>`<div class="frow"><label>${KEYN[k]}</label><input data-k="${k}" class="skey" placeholder="не задан" value="${esc(s.keys[k]||"")}"></div>`).join("")}
@@ -1708,12 +1942,14 @@ async function openSettings(){const s=await api("settings"),i=await api("info");
   <div class="sec"><b>Прочее</b>${chk("supd",s.check_updates,"Проверять обновления на GitHub при запуске")}</div>
   <div class="sec"><b>Портативный режим</b><div class="hint">${i.portable?"✓ Включён: данные хранятся в папке ProvenioData рядом с программой.":"Данные в профиле пользователя: "+esc(i.data_dir)}</div>
    ${i.portable||IOS?"":`<button class="ghost" id="sport" style="margin-top:6px">💾 Перенести данные к программе (флешка)</button>`}</div>
+  ${accountSection()}
   <div class="row" style="margin-top:14px"><button class="btn" id="ssave">Сохранить</button><span class="pmsg">Provenio ${esc(i.version)} · инструментов: ${i.tools} · сайтов для поиска по нику: ${i.sites}<br>Данные: ${esc(i.data_dir)}</span></div>`);
  b.querySelector("#ssave").onclick=async()=>{const keys={};b.querySelectorAll(".skey").forEach(x=>keys[x.dataset.k]=x.value);
   const g=id=>b.querySelector(id);
   try{await api("settings",{proxy:g("#sproxy").value,timeout:+g("#stime").value||15,keys,ai_model:g("#smodel").value,
    capture_screenshot:g("#scap").checked,capture_pdf:g("#spdf").checked,tsa_enabled:g("#stsa").checked,tsa_url:g("#stsau").value,check_updates:g("#supd").checked});
    toast("Настройки сохранены","ok");closeModal()}catch(x){toast(x.message,"bad")}};
+ bindAccount(b);
  const sp=b.querySelector("#sport");if(sp)sp.onclick=async()=>{if(!confirm("Скопировать все данные в папку ProvenioData рядом с программой и включить портативный режим?"))return;
   try{const r=await api("portable",{});toast(r.message,"ok");closeModal()}catch(x){toast(x.message,"bad")}}}
 
@@ -1772,9 +2008,10 @@ async function openPlaybooks(){if(!cur)return toast("Сначала выбери
    else b.querySelector("#pm").textContent=f.error||f.state}catch(x){toast(x.message,"bad")}}}
 
 /* =================== ИИ-СВОДКА =================== */
-function md(t){const L=esc(t).split("\n");let h="",inT=false,inL=false;
- const il=s=>s.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/`([^`]+)`/g,"<code>$1</code>");
+function md(t){const L=esc(t).split("\n");let h="",inT=false,inL=false,inC=false;
+ const il=s=>s.replace(/\\([*_|])/g,"$1").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s.,;:)!?]|$)/g,"$1<i>$2</i>").replace(/`([^`]+)`/g,"<code>$1</code>");
  for(const raw of L){const l=raw.trim();
+  if(/^```/.test(l)){h+=inC?"</pre>":"<pre>";inC=!inC;continue}if(inC){h+=raw+"\n";continue}
   if(/^\|/.test(l)){if(/^\|[\s:|-]+\|$/.test(l))continue;const cells=l.replace(/^\||\|$/g,"").split("|").map(c=>il(c.trim()));
    if(!inT){h+="<table><tr>"+cells.map(c=>`<th>${c}</th>`).join("")+"</tr>";inT=true}else h+="<tr>"+cells.map(c=>`<td>${c}</td>`).join("")+"</tr>";continue}
   if(inT){h+="</table>";inT=false}
@@ -1785,7 +2022,7 @@ function md(t){const L=esc(t).split("\n");let h="",inT=false,inL=false;
  return h+(inT?"</table>":"")+(inL?"</ul>":"")}
 async function openAi(){if(!cur)return toast("Сначала выберите кейс","bad");const s=await api("settings");
  const b=modal("✨ ИИ-сводка кейса",`<div class="hint" style="margin-bottom:10px">Claude прочитает источники, сущности, хронологию и пересечения кейса и составит сводку: главное, ключевые сущности, связи, слабые места и следующие шаги.
-  <br><b style="color:var(--warn)">Данные кейса будут отправлены в Anthropic API</b> (модель ${esc(s.ai_model||"claude-opus-5-5")}). ${s.keys.anthropic?"Ключ задан.":"⚠ Ключ не задан — добавьте его в ⚙ Настройках."}</div>
+  <br><b style="color:var(--warn)">Данные кейса будут отправлены в Anthropic API</b>. Запрос тратит кредиты вашего аккаунта Anthropic по его тарифу — Provenio ничего не берёт. (модель ${esc(s.ai_model||"claude-opus-5-5")}). ${s.keys.anthropic?"Ключ задан.":"⚠ Ключ не задан — добавьте его в ⚙ Настройках."}</div>
   <div class="row"><button class="btn" id="ago" ${s.keys.anthropic?"":"disabled"}>Составить сводку</button><button class="ghost" id="asave" hidden>＋ В кейс</button><button class="ghost" id="acopy" hidden>⧉ Копировать</button></div>
   <div class="prog ind" id="ap" hidden style="margin-top:12px"><i></i></div><div class="pmsg" id="am"></div><div class="md" id="ares" style="margin-top:10px"></div>`);
  let jid=null,text="";
@@ -2030,9 +2267,97 @@ function gTick(t){requestAnimationFrame(gTick);if(tab!=="globe"||!GW)return;cons
  if(now%1000<dt+20){$("#gclock").textContent=new Date(now).toISOString().slice(11,19)+" UTC";
   $("#gstat").textContent=(GV.L.flights.src?"Самолёты: "+GV.L.flights.src:"")}}
 
+
+/* =================== 2.2: АККАУНТ =================== */
+const DOCN={terms:"Условия использования",privacy:"Политика конфиденциальности",refund:"Политика возврата и отмены",thirdparty:"Сторонние сервисы и SDK"};
+async function aget(p,b){const r=await fetch("/api/"+p,{method:b?"POST":"GET",headers:{"X-Token":T,"Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});
+ const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
+async function openDoc(name){try{const d=await aget("legal?doc="+name);const b=modal("📄 "+esc(DOCN[name]||name),`<div class="md">${md(d.text)}</div>`);
+  b.closest(".modal-bg").style.zIndex=95}catch(x){toast(x.message,"bad")}}
+function openDocs(){const b=modal("📄 Документы",`<div class="docs">${Object.keys(DOCN).map(k=>`<button class="ghost" data-doc="${k}">${DOCN[k]}</button>`).join("")}</div>
+ <div class="hint" style="margin-top:12px">Provenio бесплатен: без подписок, платных функций и скрытых платежей. Нет телеметрии, рекламы и рассылок — нечего «отписывать».</div>`);
+ b.onclick=e=>{const d=e.target.closest("[data-doc]");if(d)openDoc(d.dataset.doc)}}
+const eye=id=>`<div class="pw"><input id="${id}" type="password" autocomplete="${id==="ap"?"current-password":"new-password"}"><button type="button" data-eye="${id}" title="Показать пароль">👁</button></div>`;
+function pwScore(p){let s=0;if(p.length>=8)s++;if(p.length>=12)s++;if(/[a-zа-я]/.test(p)&&/[A-ZА-Я]/.test(p))s++;if(/\d/.test(p))s++;if(/[^\w\s]/.test(p))s++;return Math.min(4,s)}
+async function showAuth(){STARTED&&closeModal();const a=$("#auth");a.hidden=false;let st;
+ try{st=await aget("auth/status")}catch(x){$("#abox").innerHTML=`<div class="aerr">${esc(x.message)}</div>`;return}
+ const box=$("#abox"),today=new Date().toISOString().slice(0,10);
+ if(!st.exists){box.innerHTML=`<h2><small>Provenio __VER__</small>Создайте аккаунт</h2>
+  <div class="sub">Аккаунт локальный: он хранится только на этом устройстве и никуда не отправляется.</div>
+  <label class="f">Имя пользователя<input id="au" autocomplete="username" maxlength="32" placeholder="латиница, цифры, . _ -"></label>
+  <label class="f">Пароль${eye("ap1")}<div class="meter"><i id="am"></i></div></label>
+  <label class="f">Повторите пароль${eye("ap2")}</label>
+  <label class="f"><span>Дата рождения <span style="font-weight:400;color:var(--mu2)">— только для проверки возраста 18+, не сохраняется</span></span><input id="ab" type="date" max="${today}" min="1900-01-01"></label>
+  <label class="cons"><input type="checkbox" id="at"> <span>Я принимаю <a data-doc="terms">Условия использования</a></span></label>
+  <label class="cons"><input type="checkbox" id="apr"> <span>Я прочитал(а) <a data-doc="privacy">Политику конфиденциальности</a></span></label>
+  <label class="cons"><input type="checkbox" id="aupd"> <span>Проверять обновления на GitHub при запуске <span class="mu">(необязательно)</span></span></label>
+  <div class="free">✓ Бесплатно навсегда: без подписок, пробных периодов, скрытых платежей и рассылок. <a class="alink" data-doc="refund">Политика возврата</a></div>
+  <div class="aerr" id="aerr"></div>
+  <button class="btn" id="ago">Создать аккаунт</button>
+  <div class="afoot"><span>Пароль нельзя восстановить — запомните его</span><a class="alink" data-doc="thirdparty">Сторонние сервисы</a></div>`;
+  const p1=box.querySelector("#ap1");p1.oninput=()=>{const sc=pwScore(p1.value),m=box.querySelector("#am");m.style.width=(sc*25)+"%";
+   m.style.background=["#fb7185","#fb7185","#fbbf24","#a3e635","#34d399"][sc]};
+  box.querySelector("#ago").onclick=async e=>{const g=id=>box.querySelector(id);e.target.classList.add("loading");g("#aerr").textContent="";
+   try{const r=await aget("auth/register",{username:g("#au").value,password:g("#ap1").value,password2:g("#ap2").value,birth:g("#ab").value,
+     accept_terms:g("#at").checked,accept_privacy:g("#apr").checked,check_updates:g("#aupd").checked});enter(r)}
+   catch(x){g("#aerr").textContent=x.message}finally{e.target.classList.remove("loading")}}}
+ else{box.innerHTML=`<h2><small>Provenio __VER__</small>С возвращением</h2>
+  <div class="sub">Войдите, чтобы открыть кейсы.</div>
+  <label class="f">Имя пользователя<input id="au" autocomplete="username" value="${esc(st.username)}"></label>
+  <label class="f">Пароль${eye("ap")}</label>
+  <div class="aerr" id="aerr"></div>
+  <button class="btn" id="ago">Войти</button>
+  <div class="afoot"><a class="alink" id="aforgot">Забыли пароль?</a><span><a class="alink" data-doc="terms">Условия</a> · <a class="alink" data-doc="privacy">Конфиденциальность</a></span></div>`;
+  const go=async()=>{const g=id=>box.querySelector(id),b=g("#ago");b.classList.add("loading");g("#aerr").textContent="";
+   try{enter(await aget("auth/login",{username:g("#au").value,password:g("#ap").value}))}catch(x){g("#aerr").textContent=x.message}finally{b.classList.remove("loading")}};
+  box.querySelector("#ago").onclick=go;box.querySelector("#ap").onkeydown=e=>{if(e.key==="Enter")go()};
+  box.querySelector("#aforgot").onclick=()=>{const m=modal("Забыли пароль?",`<div class="md"><p>Сервера и почты у Provenio нет, поэтому сбросить пароль письмом нельзя.</p>
+   <p>Пароль защищает доступ к программе на этом устройстве. Если вы его забыли, закройте Provenio и удалите файл <code>account.json</code> в папке данных
+   (<code>%LOCALAPPDATA%\\Provenio</code>). При следующем запуске создайте аккаунт заново, кейсы останутся на месте.</p>
+   <p>Доступ к папке данных защищает ваша учётная запись Windows. Ключи API зашифрованы для неё же.</p></div>`);m.closest(".modal-bg").style.zIndex=95};
+  setTimeout(()=>box.querySelector(st.username?"#ap":"#au").focus(),60)}
+ box.onclick=e=>{const d=e.target.closest("[data-doc]");if(d){e.preventDefault();openDoc(d.dataset.doc)}
+  const y=e.target.closest("[data-eye]");if(y){const i=box.querySelector("#"+y.dataset.eye);i.type=i.type==="password"?"text":"password"}}}
+function enter(r){T=r.token;ME=r.user;$("#auth").hidden=true;$("#uname").textContent=ME.username;$("#uav").textContent=ME.username.slice(0,1);
+ if(ME.terms_version!==ME.current_terms)termsUpdate();
+ if(!STARTED){STARTED=true;renderTools();moveInk();sizeCv();setTimeout(checkUpdates,4000)}cur=null;loadCases()}
+function termsUpdate(){const b=modal("Обновлены условия",`<div class="hint">Условия использования и Политика конфиденциальности изменились. Прочитайте их и примите, чтобы продолжить, или выйдите.</div>
+ <div class="docs" style="margin:12px 0"><button class="ghost" data-doc="terms">Условия</button><button class="ghost" data-doc="privacy">Конфиденциальность</button></div>
+ <div class="row"><button class="btn" id="tacc">Принимаю</button><button class="ghost" id="tdec">Не принимаю — выйти</button></div>`);
+ b.closest(".modal-bg").onclick=null;
+ b.onclick=async e=>{const d=e.target.closest("[data-doc]");if(d)return openDoc(d.dataset.doc);
+  if(e.target.id==="tacc"){await api("auth/accept_terms",{});closeModal()}if(e.target.id==="tdec")logout()}}
+async function logout(){try{await api("auth/logout",{})}catch(x){}T=PAGE_T;ME=null;cases=[];cur=null;st=null;closeModal();showAuth()}
+$("#logout").onclick=logout;$("#docsb").onclick=openDocs;
+function accountSection(){return `<div class="sec" style="margin-top:14px"><b>Аккаунт</b>
+  <div class="hint">Пользователь <b style="color:var(--tx)">${esc(ME?ME.username:"")}</b> · создан ${esc(ME?ME.created:"")}. Аккаунт и данные хранятся только на этом устройстве.</div>
+  <div class="row" style="margin-top:8px;gap:7px"><button class="ghost" id="spw">🔑 Сменить пароль</button><button class="ghost" id="sdocs">📄 Документы</button>
+  <button class="ghost" id="sout">⎋ Выйти</button><button class="ghost danger" id="sdel">🗑 Удалить аккаунт</button></div></div>`}
+function bindAccount(b){b.querySelector("#sout").onclick=logout;b.querySelector("#sdocs").onclick=openDocs;
+ b.querySelector("#spw").onclick=()=>{const m=modal("🔑 Смена пароля",`<label class="f">Текущий пароль${eye("po")}</label><label class="f">Новый пароль${eye("pn")}</label>
+  <label class="f">Повторите новый пароль${eye("pn2")}</label><div class="aerr" id="perr"></div>
+  <div class="row"><button class="btn" id="pgo">Сменить</button><button class="ghost" id="pcancel">Отмена</button></div>`);m.classList.add("abox");m.style.width="auto";m.style.padding="0";
+  m.onclick=async e=>{const y=e.target.closest("[data-eye]");if(y){const i=m.querySelector("#"+y.dataset.eye);i.type=i.type==="password"?"text":"password"}
+   if(e.target.id==="pcancel")closeModal();
+   if(e.target.id==="pgo")try{const r=await api("auth/password",{old:m.querySelector("#po").value,new:m.querySelector("#pn").value,new2:m.querySelector("#pn2").value});toast(r.message,"ok");closeModal()}
+   catch(x){m.querySelector("#perr").textContent=x.message}}};
+ b.querySelector("#sdel").onclick=()=>{const m=modal("🗑 Удаление аккаунта",`<div class="md"><p>Будут <b>безвозвратно</b> удалены с этого устройства:</p>
+  <ul><li>аккаунт <b>${esc(ME.username)}</b> и пароль;</li><li>все кейсы, источники, сущности и журнал аудита;</li><li>снимки страниц, скриншоты и PDF;</li><li>ключи API и настройки.</li></ul>
+  <p>Если нужны копии — сначала сделайте <b>Экспорт ▾ → Пакет доказательств</b> для каждого кейса.</p></div>
+  <label class="f" style="margin-top:8px">Пароль${eye("dp")}</label>
+  <label class="f"><span>Для подтверждения введите слово <b style="color:var(--bad)">УДАЛИТЬ</b></span><input id="dc" autocomplete="off"></label>
+  <div class="aerr" id="derr"></div>
+  <div class="row"><button class="btn danger" id="dgo">Удалить навсегда</button><button class="ghost" id="dcancel">Отмена</button></div>`);
+  m.onclick=async e=>{const y=e.target.closest("[data-eye]");if(y){const i=m.querySelector("#"+y.dataset.eye);i.type=i.type==="password"?"text":"password"}
+   if(e.target.id==="dcancel")closeModal();
+   if(e.target.id==="dgo"){e.target.classList.add("loading");
+    try{const r=await api("auth/delete",{password:m.querySelector("#dp").value,confirm:m.querySelector("#dc").value});
+     T=PAGE_T;ME=null;cases=[];cur=null;st=null;closeModal();render&&render();renderCases();
+     toast(r.left&&r.left.length?"Аккаунт удалён. Не удалось стереть: "+r.left.join(", "):"Аккаунт и все данные удалены","ok");showAuth()}
+    catch(x){m.querySelector("#derr").textContent=x.message}finally{e.target.classList.remove("loading")}}}}}
 $("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
-setInterval(async()=>{try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
-window.addEventListener("load",()=>{renderTools();moveInk();sizeCv();loadCases();setTimeout(checkUpdates,4000)});
+setInterval(async()=>{if(!ME)return;try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
+window.addEventListener("load",showAuth);
 </script></body></html>
 """
 

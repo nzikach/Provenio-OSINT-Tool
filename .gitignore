@@ -8,6 +8,7 @@ venv/
 build/
 dist/
 *.spec
+installer/Output/
 
 # Локальные данные кейсов (база и снимки) — не публикуем
 provenio_data/
@@ -22,6 +23,8 @@ Thumbs.db
 ios/src/provenio_app/provenio*.py
 ios/src/provenio_app/provenio_sites.json
 ios/src/provenio_app/assets/
+ios/src/provenio_app/legal/
 ios/icons/
 ios/logs/
 ios/dd/
+installer/TERMS.txt

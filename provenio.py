@@ -38,7 +38,7 @@ import urllib.error
 from html.parser import HTMLParser
 
 APP_NAME = "Provenio"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 # каталог с ресурсами (в exe PyInstaller распаковывает их во временную папку)
@@ -266,6 +266,114 @@ def extract_entities_data(data, cap=500):
     return found
 
 
+# ----------------------------------------------------------------- защита от SQL-инъекций
+# Все запросы Provenio параметризованы (значения передаются через «?», а не вставляются в текст).
+# SafeConnection проверяет это на каждом вызове, поэтому ошибка в будущем коде не станет дырой:
+#  * классическая/UNION/boolean/time-based инъекция — в тексте запроса запрещены строковые литералы,
+#    комментарии и «;»: значение пользователя физически не может оказаться в SQL, только в параметрах;
+#  * stacked queries (несколько команд через «;») — запрещены и sqlite3, и проверкой;
+#  * second-order (вредная строка сначала сохраняется, потом попадает в запрос) — тоже только параметры;
+#  * подмена типов — параметры только None/int/float/str/bytes, число «?» должно совпадать;
+#  * ATTACH/DETACH чужой базы, PRAGMA, load_extension, DROP — блокирует авторизатор SQLite;
+#  * подмена схемы (trusted_schema, defensive mode) — выключены опасные возможности ядра SQLite.
+SQL_FORBIDDEN = re.compile(r"'|\"|--|/\*|\*/|;|\x00|\b(?:ATTACH|DETACH|PRAGMA|VACUUM|load_extension)\b", re.I)
+SQL_PARAM_TYPES = (type(None), int, float, str, bytes)
+
+
+class SQLInjectionError(sqlite3.ProgrammingError):
+    pass
+
+
+def check_sql(sql, params=()):
+    if not isinstance(sql, str):
+        raise SQLInjectionError("SQL-запрос должен быть строкой")
+    m = SQL_FORBIDDEN.search(sql)
+    if m:
+        raise SQLInjectionError(f"Запрещённый фрагмент в тексте SQL: {m.group(0)!r} — значения передавайте параметрами")
+    if isinstance(params, dict):
+        raise SQLInjectionError("Именованные параметры не используются")
+    params = tuple(params or ())
+    if sql.count("?") != len(params):
+        raise SQLInjectionError(f"Число параметров ({len(params)}) не совпадает с числом «?» ({sql.count('?')})")
+    for v in params:
+        if not isinstance(v, SQL_PARAM_TYPES):
+            raise SQLInjectionError(f"Недопустимый тип параметра: {type(v).__name__}")
+    return params
+
+
+_DENY = {getattr(sqlite3, n) for n in ("SQLITE_ATTACH", "SQLITE_DETACH", "SQLITE_DROP_TABLE", "SQLITE_DROP_INDEX",
+                                        "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_CREATE_TRIGGER",
+                                        "SQLITE_CREATE_VIEW", "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER",
+                                        "SQLITE_CREATE_VTABLE", "SQLITE_DROP_VTABLE") if hasattr(sqlite3, n)}
+_FUNC_DENY = {"load_extension", "readfile", "writefile", "fts3_tokenizer", "edit"}
+
+
+def _authorizer(action, a1, a2, db, trigger):
+    if action in _DENY:
+        return sqlite3.SQLITE_DENY
+    if action == getattr(sqlite3, "SQLITE_PRAGMA", -1) and (a1 or "").lower() not in ("table_info", "data_version"):
+        return sqlite3.SQLITE_DENY
+    if action == getattr(sqlite3, "SQLITE_FUNCTION", -2) and (a2 or "").lower() in _FUNC_DENY:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+class SafeCursor(sqlite3.Cursor):
+    def execute(self, sql, params=()):
+        if getattr(self.connection, "sealed", False):
+            params = check_sql(sql, params)
+        return super().execute(sql, params)
+
+    def executemany(self, sql, seq):
+        if getattr(self.connection, "sealed", False):
+            seq = [check_sql(sql, p) for p in seq]
+        return super().executemany(sql, seq)
+
+    def executescript(self, script):
+        raise SQLInjectionError("executescript запрещён")
+
+
+class SafeConnection(sqlite3.Connection):
+    """Соединение SQLite, которое пропускает только параметризованные запросы."""
+    sealed = False
+
+    def cursor(self, factory=None):
+        return super().cursor(factory or SafeCursor)
+
+    def execute(self, sql, params=()):
+        return self.cursor().execute(sql, params)
+
+    def executemany(self, sql, seq):
+        return self.cursor().executemany(sql, seq)
+
+    def executescript(self, script):
+        if self.sealed:
+            raise SQLInjectionError("executescript запрещён после инициализации базы")
+        return super().executescript(script)
+
+    def seal(self):
+        """Включает защиту: после миграций схемы — только параметризованные DML-запросы."""
+        try:
+            self.enable_load_extension(False)
+        except (AttributeError, sqlite3.Error):
+            pass
+        if hasattr(self, "setconfig"):   # Python 3.12+
+            for name in ("SQLITE_DBCONFIG_DEFENSIVE", "SQLITE_DBCONFIG_TRUSTED_SCHEMA"):
+                if hasattr(sqlite3, name):
+                    try:
+                        self.setconfig(getattr(sqlite3, name), name.endswith("DEFENSIVE"))
+                    except sqlite3.Error:
+                        pass
+        self.set_authorizer(_authorizer)
+        self.sealed = True
+
+
+def connect_safe(path):
+    con = sqlite3.connect(path, check_same_thread=False, factory=SafeConnection)
+    con.row_factory = sqlite3.Row
+    return con
+
+
 # ----------------------------------------------------------------- хранилище
 class Store:
     def __init__(self, path=None, snap_dir=None):
@@ -277,8 +385,8 @@ class Store:
         os.makedirs(snap_dir, exist_ok=True)
         self.snap_dir = snap_dir
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self.db = connect_safe(path)
+        self.db.execute("PRAGMA trusted_schema=OFF")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS cases(id INTEGER PRIMARY KEY, name TEXT UNIQUE, created TEXT);
         CREATE TABLE IF NOT EXISTS sources(
@@ -312,8 +420,9 @@ class Store:
                            ("query", "TEXT DEFAULT ''"), ("parent_id", "INTEGER"),
                            ("ctype", "TEXT DEFAULT 'text/html'"), ("found_on", "INTEGER")):
             if name not in have:
-                self.db.execute(f"ALTER TABLE sources ADD COLUMN {name} {decl}")
+                self.db.executescript(f"ALTER TABLE sources ADD COLUMN {name} {decl}")
         self.db.commit()
+        self.db.seal()   # дальше — только параметризованные запросы (защита от SQL-инъекций)
 
     # --- аудит с хэш-цепочкой
     def audit(self, action, detail=""):
@@ -1227,7 +1336,7 @@ def _dpapi(data, protect):
 
 SECRET_KEYS = ("shodan", "virustotal", "abuseipdb", "urlscan", "otx", "github", "anthropic")
 OPTIONS = {"capture_screenshot": True, "capture_pdf": False, "tsa_enabled": True, "tsa_url": "",
-           "check_updates": True, "ai_model": "claude-opus-5-5"}
+           "check_updates": False, "ai_model": "claude-opus-5-5"}
 
 
 def load_settings():

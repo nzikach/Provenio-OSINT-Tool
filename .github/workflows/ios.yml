@@ -1,4 +1,4 @@
-name: Build Provenio.ipa
+name: Build Provenio for iPhone (IPA)
 
 # Неподписанный IPA для iPhone/iPad (устанавливается через AltStore, SideStore,
 # Sideloadly или TrollStore — они подписывают его вашим Apple ID).
@@ -55,8 +55,9 @@ jobs:
           echo "App: $APP"; du -sh "$APP"
           rm -rf out && mkdir -p out/Payload
           cp -R "$APP" out/Payload/
-          (cd out && zip -qry Provenio.ipa Payload)
-          shasum -a 256 out/Provenio.ipa | awk '{print $1"  Provenio.ipa"}' > out/Provenio.ipa.sha256
+          V=$(grep -oE 'APP_VERSION = "[^"]+"' provenio.py | cut -d'"' -f2)
+          (cd out && zip -qry "Provenio-$V.ipa" Payload && rm -rf Payload)
+          (cd out && shasum -a 256 "Provenio-$V.ipa" > "Provenio-$V.ipa.sha256")
           ls -la out
 
       - name: Report failure details
@@ -73,14 +74,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Provenio-ipa
-          path: |
-            out/Provenio.ipa
-            out/Provenio.ipa.sha256
+          path: out/*
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            out/Provenio.ipa
-            out/Provenio.ipa.sha256
+          files: out/*

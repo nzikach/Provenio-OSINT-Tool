@@ -1074,8 +1074,9 @@ def check_update(current=P.APP_VERSION):
 
     def ver(v):
         return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
-    exe = next((a.get("browser_download_url") for a in j.get("assets") or [] if a.get("name", "").endswith(".exe")),
-               None)
+    assets = [a for a in j.get("assets") or [] if a.get("name", "").endswith(".exe")]
+    assets.sort(key=lambda a: "setup" not in a.get("name", "").lower())   # сначала установщик
+    exe = assets[0].get("browser_download_url") if assets else None
     return {"current": current, "latest": tag, "newer": bool(tag) and ver(tag) > ver(current),
             "url": j.get("html_url"), "exe": exe, "published": j.get("published_at"),
             "notes": (j.get("body") or "")[:1500]}
