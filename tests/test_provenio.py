@@ -532,6 +532,94 @@ class SecTests(unittest.TestCase):
             self.assertEqual(S.jpeg_quality({0: zz}), (q, True))
 
 
+class UniqueTests(unittest.TestCase):
+    def test_ots_roundtrip_and_info(self):
+        import hashlib
+        import provenio_unique as U
+        d = hashlib.sha256(b"x").digest()
+        root = U.OTS(d)
+        child = U.OTS(U._op(0xF0, b"\x01\x02", d))
+        child.att.append((U.ATT_PENDING, U._uvar(len(b"https://cal.example")) + b"https://cal.example"))
+        root.ops.append((0xF0, b"\x01\x02", child))
+        btc = U.OTS(U._op(0x08, b"", d))
+        btc.att.append((U.ATT_BTC, U._uvar(840000)))
+        root.ops.append((0x08, b"", btc))
+        data = U.ots_file(d, root)
+        d2, r2 = U.ots_parse_file(data)
+        self.assertEqual(d2, d)
+        self.assertEqual(U.ots_file(d2, r2), data)
+        info = U.ots_info(data)
+        self.assertEqual(info["pending"], ["https://cal.example"])
+        self.assertEqual(info["bitcoin"][0]["height"], 840000)
+        self.assertEqual(info["bitcoin"][0]["merkle"], hashlib.sha256(d).digest()[::-1].hex())
+        with self.assertRaises(ValueError):
+            U.ots_parse_file(b"not an ots file")
+
+    def test_verify_html_and_anchors(self):
+        import provenio_unique as U
+        s = new_store()
+        cid = s.add_case("verify")
+        s.add_tool_result(cid, "ioc", "1.2.3.4", {"text": "1.2.3.4"})
+        aid = s.add_anchor(cid, "audit", "audit_head:x", "ab" * 32, b"proof")
+        self.assertEqual(s.anchors(cid)[0]["id"], aid)
+        self.assertEqual(len(s.anchors(pending_only=True)), 1)
+        s.update_anchor(aid, b"proof2", "confirmed", 840000, "2026-01-01 00:00 UTC")
+        self.assertEqual(s.anchors(cid)[0]["height"], 840000)
+        page = U.build_verify_html(s, s.case(cid), [{"kind": "OTS", "digest": "ab", "status": "ok"}]).decode()
+        self.assertIn("crypto.subtle", page)
+        data = json.loads(page.split('type="application/json">', 1)[1].split("</script>", 1)[0])
+        self.assertEqual(len(data["files"]), 1)
+        self.assertTrue(data["files"][0]["b64"])
+        self.assertEqual(data["audit"][-1]["hash"], s.db.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()[0])
+
+    def test_ach_storage(self):
+        s = new_store()
+        cid = s.add_case("ach")
+        self.assertEqual(s.ach_get(cid), (None, None))
+        m = {"hyps": [{"id": 1, "text": "А"}], "ev": [{"id": 2, "text": "' OR 1=1 --"}], "cells": {"2": {"1": "I"}}}
+        s.ach_set(cid, m)
+        self.assertEqual(s.ach_get(cid)[0], m)
+        s.ach_set(cid, {"hyps": [], "ev": [], "cells": {}})
+        self.assertEqual(s.ach_get(cid)[0]["hyps"], [])
+
+    def test_overpass_query(self):
+        import provenio_unique as U
+        q = U.overpass_query(("church", ""), [("river", "", 200), ("custom", "man_made=crane", 99999)], [55.7, 37.5, 55.8, 37.7], 'Никол\\"')
+        self.assertIn('[bbox:55.70000,37.50000,55.80000,37.70000]', q)
+        self.assertIn('["name"~"Никол",i]', q)                # кавычки и спецсимволы вырезаны
+        self.assertIn('(around.a:200)', q)
+        self.assertIn('nwr["man_made"="crane"](around.a:5000)', q)   # расстояние ограничено
+        with self.assertRaises(ValueError):
+            U.overpass_query(("custom", 'x"];out;'), [], [0, 0, 1, 1])
+
+    def test_pattern_of_life_timezone(self):
+        import datetime as dt
+        import random
+        import provenio_unique as U
+        rnd = random.Random(1)
+        base = dt.datetime(2026, 1, 5, tzinfo=dt.timezone.utc)
+        ts = []
+        for day in range(60):
+            for _ in range(rnd.randint(4, 9)):
+                local_h = rnd.choice(list(range(8, 24)))           # человек спит 00–08 по местному
+                ts.append((base + dt.timedelta(days=day, hours=local_h - 3, minutes=rnd.randint(0, 59))).timestamp())
+        r = U.pattern_of_life({"q": "\n".join(str(int(t)) for t in ts)})
+        self.assertLessEqual(abs(r["utc_offset"] - 3), 1)       # UTC+3
+        self.assertEqual(sum(map(sum, r["heat_utc"])), r["events"])
+        with self.assertRaises(ValueError):
+            U.pattern_of_life({"q": "2026-01-01"})
+
+    def test_attribution_helpers(self):
+        import provenio_unique as U
+        a, _ = U._simhash("<html><body>" + "<div><p><a></a></p></div>" * 30 + "</body></html>")
+        b, _ = U._simhash("<html><body>" + "<div><p><a></a></p></div>" * 31 + "</body></html>")
+        c, _ = U._simhash("<html>" + "<table><tr><td><span></span></td></tr></table>" * 30 + "</html>")
+        self.assertGreater(U._sim(a, b), U._sim(a, c))
+        self.assertEqual(U._dom("https://www.Example.com/path"), "example.com")
+        with self.assertRaises(ValueError):
+            U.attribution("one.com")
+
+
 class UITests(unittest.TestCase):
     def test_page_and_api(self):
         import threading
@@ -591,6 +679,11 @@ class UITests(unittest.TestCase):
             ct = call("ct", {"action": "config", "keywords": ["MyBrand", "x"], "allow": ["mybrand.com"]})
             self.assertEqual(ct["cfg"]["keywords"], ["mybrand"])           # слишком короткие отброшены
             self.assertFalse(ct["running"])
+            self.assertEqual(call("anchors?case=" + str(cid)), [])
+            self.assertIsNone(call("ach?case=" + str(cid))["data"])
+            saved = call("ach", {"case": cid, "data": {"hyps": [{"id": 1, "text": "H"}], "ev": [], "cells": {}}})
+            self.assertEqual(saved["data"]["hyps"][0]["text"], "H")
+            self.assertTrue(any(f["id"] == "church" for f in call("geopuzzle_features")))
             for tab in ("p-globe", "p-radar", "p-leaks", "p-labs", "p-ct"):
                 self.assertIn(tab, page)
             world = direct.open(urllib.request.Request(base + "/static/world.json",

@@ -28,6 +28,8 @@ import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, г
 import provenio_auth as A   # 2.2: локальная учётная запись
 import provenio_labs as XL  # 2.3: XSS-лаборатория (отдельный сервер, другой origin)
 import provenio_sec as SEC  # 2.4: магия, криминалистика фото, email, вымогатели, CT-поток
+import provenio_unique as UQ  # 2.5: якоря OpenTimestamps, свидетель, атрибуция, геопазл, самоаудит, ритм жизни
+import hashlib
 
 S = P.Store()
 LOCK = S.lock
@@ -291,6 +293,9 @@ def monitor_loop():
     while True:
         time.sleep(30)
         threading.Thread(target=SEC.RW.check, daemon=True).start()   # сама решает, пора ли (раз в 6 ч)
+        if time.time() - globals().get("_LAST_ANCHOR", 0) > 3600:
+            globals()["_LAST_ANCHOR"] = time.time()
+            threading.Thread(target=anchors_loop_once, daemon=True).start()
         try:
             for sid in S.due_monitors():
                 S.check_monitor(sid, capture=capture_fn())
@@ -299,6 +304,79 @@ def monitor_loop():
         if time.time() - last_brand > 120:
             last_brand = time.time()
             threading.Thread(target=brand_loop_once, daemon=True).start()
+
+
+# ----------------------------------------------------------------- 2.5: якоря, свидетель, гипотезы, геопазл
+def anchor_public(a):
+    info = {}
+    try:
+        info = UQ.ots_info(a["proof"])
+    except Exception:
+        pass
+    return {k: a[k] for k in ("id", "case_id", "created", "kind", "subject", "digest", "status", "height", "block_time")} | \
+        {"calendars": info.get("pending", [])}
+
+
+def anchor_check(aid):
+    a = next((x for x in S.anchors() if x["id"] == aid), None)
+    if not a:
+        raise KeyError("Нет такого якоря")
+    proof, _ = UQ.ots_upgrade(a["proof"])
+    info = UQ.ots_verify(proof)
+    ok = [v for v in info["verified"] if v.get("ok")]
+    if ok:
+        S.update_anchor(aid, proof, "confirmed", ok[0]["height"], ok[0]["time"])
+    elif proof != a["proof"]:
+        S.update_anchor(aid, proof, "pending")
+    return anchor_public(next(x for x in S.anchors() if x["id"] == aid))
+
+
+def anchors_loop_once():
+    for a in S.anchors(pending_only=True):
+        try:
+            anchor_check(a["id"])
+        except Exception:
+            traceback.print_exc()
+
+
+def unique_api(path, q, body):
+    qv = lambda k: (q.get(k) or [""])[0]   # noqa: E731
+    if path == "anchors":
+        return [anchor_public(a) for a in S.anchors(int(qv("case")))]
+    if path == "anchor":
+        c = case_by_id(int(body["case"]))
+        S.audit("anchor_requested", f"case={c['id']} {c['name']}")
+        head = S.db.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()["hash"]
+        digest = hashlib.sha256(head.encode()).digest()
+        proof, cals = UQ.ots_stamp(digest)
+        aid = S.add_anchor(c["id"], "audit", f"audit_head:{head}", digest.hex(), proof)
+        return {"id": aid, "calendars": cals, "audit_head": head}
+    if path == "anchor_check":
+        return anchor_check(int(body["id"]))
+    if path == "witness":
+        sid = int(body["id"])
+        src = S.source(sid)
+        ours = P.snapshot_text(S.snapshot_bytes(src) or b"")
+
+        def work(job):
+            job.note("Internet Archive сохраняет страницу (до 2 минут)…")
+            r = UQ.witness(src["final_url"] or src["url"], ours)
+            S.add_attachment(sid, "witness", json.dumps(r, ensure_ascii=False, indent=1).encode(), "json",
+                             note=f"{r['verdict'] or ''} {r['similarity'] if r['similarity'] is not None else ''}%")
+            return r
+        return start_custom("witness", src["url"], work, saveable=False)
+    if path == "ach":
+        cid = int(body.get("case") or qv("case"))
+        if body.get("data") is not None:
+            S.ach_set(cid, body["data"])
+        data, upd = S.ach_get(cid)
+        return {"data": data, "updated": upd}
+    if path == "geopuzzle_features":
+        return [{"id": k, "label": v[0]} for k, v in UQ.FEATURES.items()] + [{"id": "custom", "label": "🏷 Свой тег OSM…"}]
+    if path == "geopuzzle":
+        params = {k: body.get(k) for k in ("area", "bbox", "anchor", "anchor_custom", "constraints", "name")}
+        return start_custom("geopuzzle", params.get("area") or "вид глобуса", lambda job: UQ.geopuzzle({**params, "_job": job}))
+    raise KeyError(path)
 
 
 # ----------------------------------------------------------------- 2.4: CT-поток и наблюдение за вымогателями
@@ -641,6 +719,8 @@ def api(path, q, body):
         return labs_api(path, q, body)
     if path in ("ct", "ransom_watch"):
         return sec_api(path, body)
+    if path in ("anchors", "anchor", "anchor_check", "witness", "ach", "geopuzzle_features", "geopuzzle"):
+        return unique_api(path, q, body)
     if path == "info":
         return {"version": P.APP_VERSION, "data_dir": P.DATA_DIR, "frozen": P.FROZEN, "portable": P.PORTABLE,
                 "sites": len(TL.load_sites()), "tools": len(TL.TOOLS), "browser": X.find_browser(),
@@ -685,6 +765,11 @@ def download(kind, cid):
         if data is None:
             raise KeyError("Файл не найден")
         return data, ctype, fname
+    if kind == "ots":
+        a = next((x for x in S.anchors() if x["id"] == int(cid)), None)
+        if not a:
+            raise KeyError("Нет такого якоря")
+        return a["proof"], "application/octet-stream", f"provenio_anchor_{a['id']}_{a['digest'][:8]}.ots"
     c = case_by_id(cid)
     if not c:
         raise KeyError("Кейс не найден")
@@ -709,8 +794,17 @@ def download(kind, cid):
     if kind == "evidence":
         st = P.load_settings()
         tsa = ((st.get("tsa_url") or "").strip() or P.TSA_DEFAULT) if st.get("tsa_enabled") else None
-        data, mh = P.build_evidence_zip(S, c, tsa_url=tsa)
+        data, mh = P.build_evidence_zip(S, c, tsa_url=tsa,
+                                        ots=(lambda d: UQ.ots_stamp(d)) if st.get("ots_enabled", True) else None)
         return data, "application/zip", f"provenio_{safe}_evidence_{mh[:8]}.zip"
+    if kind == "verify":
+        anc = [{"kind": "OpenTimestamps → Bitcoin" + (f", блок {a['height']}" if a["height"] else ""),
+                "when": a["block_time"] or a["created"], "digest": a["digest"],
+                "status": "подтверждено в блокчейне" if a["status"] == "confirmed" else "ожидает включения в блок",
+                "check": f"скачайте .ots в Provenio (⛓ Якоря) и проверьте на opentimestamps.org; хэшируется {a['subject'][:80]}"}
+               for a in S.anchors(c["id"])]
+        S.audit("verify_report_exported", c["name"])
+        return UQ.build_verify_html(S, c, anc), "application/octet-stream", f"provenio_{safe}_verifiable.html"
     raise KeyError(kind)
 
 
@@ -1354,6 +1448,28 @@ input[type=checkbox]:checked::after{left:19px;background:radial-gradient(circle 
 .chrono label{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--mu);margin:5px 0}
 .chrono input{padding:7px 10px;font-size:12px}
 @media(max-width:820px){#p-ct .cthead{grid-template-columns:1fr}.ctstats{grid-template-columns:repeat(2,1fr)}}
+
+/* ---------- 2.5: гипотезы, атрибуция, ритм, самоаудит, якоря ---------- */
+.ach{overflow:auto;max-height:62vh}.ach table{border-collapse:separate;border-spacing:0;font-size:12.5px;min-width:100%}
+.ach th,.ach td{padding:5px;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:middle}
+.ach th{position:sticky;top:0;background:#140e22;z-index:1}.ach th input{min-width:130px;font-weight:700}
+.ach td.ev{min-width:260px}.ach td.ev input{width:100%}.ach select{padding:5px 6px;font-size:12px;border-radius:9px;width:auto}
+.ach .c-CC{background:rgba(52,211,153,.28)}.ach .c-C{background:rgba(52,211,153,.13)}.ach .c-I{background:rgba(251,113,133,.15)}
+.ach .c-II{background:rgba(251,113,133,.32)}.ach .c-N{background:rgba(255,255,255,.04)}
+.ach tr.nd td.ev input{opacity:.55}.ach tr.sens td.ev{box-shadow:inset 3px 0 0 var(--warn)}
+.ach tfoot td{font-weight:800;border-top:1px solid var(--bd2)}.ach .best{color:var(--ok);text-shadow:0 0 12px rgba(52,211,153,.6)}
+.clu{border-left:3px solid var(--ac);padding:10px 14px;margin:8px 0;border-radius:12px;background:rgba(139,92,246,.08)}
+.clu b.n{font-size:15px}.clu .tag{margin:3px 4px 0 0}
+.heat{display:grid;grid-template-columns:34px repeat(24,1fr);gap:2px;font-size:10px;margin:8px 0}
+.heat span{aspect-ratio:1;border-radius:4px;background:rgba(255,255,255,.04)}.heat i{font-style:normal;color:var(--mu2);text-align:center;align-self:center}
+.score{display:flex;gap:16px;align-items:center;margin-bottom:10px}
+.fnd{display:grid;grid-template-columns:78px 1fr;gap:8px;padding:8px 10px;border-radius:11px;margin:5px 0;background:rgba(255,255,255,.03);border:1px solid var(--edge);font-size:12.5px}
+.fnd .sv{font-weight:800;font-size:11px;text-transform:uppercase}.fnd .fx2{color:var(--mu);font-size:12px;margin-top:3px}
+.anc{display:flex;gap:10px;align-items:center;padding:9px 12px;border-radius:12px;border:1px solid var(--edge);margin:6px 0;font-size:12.5px}
+.anc .st{font-weight:800}.anc.confirmed{border-color:rgba(52,211,153,.45)}.anc.pending .st{color:var(--warn)}.anc.confirmed .st{color:var(--ok)}
+.gp label{display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--mu);margin:4px 0}.gp select,.gp input{padding:6px 9px;font-size:12px}
+.gp .cr{display:grid;grid-template-columns:1fr 78px 26px;gap:5px;align-items:center;margin:4px 0}
+.gpres div{padding:6px 8px;border-radius:8px;font-size:11.5px;cursor:pointer;color:var(--mu)}.gpres div:hover{background:rgba(139,92,246,.2);color:#fff}
 /* ---------- экран входа и регистрации ---------- */
 #auth{position:fixed;inset:0;z-index:90;display:grid;place-items:center;overflow:auto;padding:28px 16px;background:#030205}
 #auth .bg,#auth .liquid{position:absolute}
@@ -1446,6 +1562,8 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
   <button class="ghost" id="ver">Проверить</button>
   <button class="ghost" id="pbb">▶ Сценарий</button>
   <button class="ghost" id="aib">✨ ИИ-сводка</button>
+  <button class="ghost" id="achb">⚖ Гипотезы</button>
+  <button class="ghost" id="ancb">⛓ Якоря</button>
   <button class="ghost" id="cmp">Сравнить</button>
   <button class="ghost" id="rep">Экспорт ▾</button>
   <span class="pill ok" id="pill">целостность</span>
@@ -1504,6 +1622,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
     <label class="gl"><input type="checkbox" id="gnight" checked> 🌗 День и ночь</label>
     <label class="gl"><input type="checkbox" id="gauto" checked> ⟳ Вращение</label>
     <button class="ghost" id="gchrono" style="justify-content:center">☀ Хронолокация по тени</button>
+    <button class="ghost" id="gpuzzle" style="justify-content:center">🧩 Геопазл: место по приметам</button>
     <div class="pmsg" id="gstat"></div>
    </div>
    <div class="ginfo card" id="ginfo"></div>
@@ -1578,9 +1697,10 @@ function render(){
   <div class="row"><div class="seg" data-id="${s.id}" title="Надёжность источника">${[1,2,3,4,5].map(n=>`<button data-r="${n}" class="${n<=s.reliability?"on":""}">${n}</button>`).join("")}</div>
   <input class="note" data-id="${s.id}" placeholder="Заметка…" value="${esc(s.note)}">
   ${s.snapshot?`<a class="ghost" target="_blank" href="/snapshot/${encodeURIComponent(s.snapshot)}?t=${T}">${tool?"JSON":"Снимок"}</a>`:""}
-  ${(s.att||[]).map(a=>`<a class="ghost" target="_blank" title="SHA-256 ${esc(a.sha256)}" href="/snapshot/${encodeURIComponent(a.file)}?t=${T}">${a.kind==="screenshot"?"📷 Скриншот":"📄 PDF"}</a>`).join("")}
+  ${(s.att||[]).map(a=>`<a class="ghost" target="_blank" title="SHA-256 ${esc(a.sha256)}" href="/snapshot/${encodeURIComponent(a.file)}?t=${T}">${a.kind==="screenshot"?"📷 Скриншот":a.kind==="witness"?"🧾 Свидетель: "+esc(a.note||""):"📄 PDF"}</a>`).join("")}
   ${!tool&&s.status.startsWith("OK")&&!(s.att||[]).length?`<button class="ghost cap" data-id="${s.id}">📷 Снять экран</button>`:""}
   ${!tool&&s.status.startsWith("OK")?`<button class="ghost exp" data-id="${s.id}">🔗 Обойти ссылки</button>`:""}
+  ${!tool&&s.status.startsWith("OK")&&!(s.att||[]).some(a=>a.kind==="witness")?`<button class="ghost wit" data-id="${s.id}" title="Internet Archive сохранит страницу сейчас; Provenio сравнит его копию со своей">🧾 Независимый свидетель</button>`:""}
   ${!tool&&!s.parent_id?`<button class="ghost mon ${s.monitor?"on":""}" data-id="${s.id}">${s.monitor?"👁 Слежу":"👁 Следить"}</button>`:""}
   ${s.monitor?`<button class="ghost chk" data-id="${s.id}">Проверить сейчас</button>`:""}
   ${s.versions||s.parent_id?`<button class="ghost vers" data-id="${s.id}">Версии и сравнение</button>`:""}
@@ -1589,6 +1709,8 @@ function render(){
  $("#tl").innerHTML=st.audit.map((a,i)=>`<div class="ev2" style="--i:${Math.min(i,20)}"><b>${esc(a.action)}</b> <span style="color:var(--mu)">${esc(a.ts)}</span><br>${esc(a.detail)}<br><small>${esc(a.hash)}</small></div>`).join("");
  buildGraph();moveInk();if(tab==="time")renderTimeline()}
 $("#p-src").onclick=async e=>{const b=e.target.closest("button,.sha")||e.target;
+ if(b.classList.contains("wit")){b.classList.add("loading");try{const r=await api("witness",{id:b.dataset.id});const f=await waitJob(r.id);
+  toast(f.state==="done"?`Архив-свидетель: ${f.result.verdict||"сохранено"}${f.result.similarity!=null?" ("+f.result.similarity+"%)":""}`:"Свидетель не получен: "+(f.error||""),f.state==="done"?"ok":"bad")}catch(x){toast(x.message,"bad")}refresh();return}
  if(b.classList.contains("cap")){b.classList.add("loading");try{const r=await api("capture",{id:b.dataset.id});const f=await waitJob(r.id);
   toast(f.state==="done"&&f.result.added?"Скриншот сохранён как доказательство":"Не удалось снять экран: "+(f.error||"браузер не ответил"),f.state==="done"&&f.result.added?"ok":"bad")}catch(x){toast(x.message,"bad")}refresh();return}
  if(b.classList.contains("exp")){openExpand(+b.dataset.id);return}
@@ -1723,6 +1845,9 @@ async function showDiff(a,bb,el){el.innerHTML='<div class="prog ind"><i></i></di
 
 /* =================== ИНСТРУМЕНТЫ =================== */
 const TOOLS=[
+ {id:"attribution",cat:"Разведка организации",ic:"🧬",tn:"Один оператор: атрибуция доменов",td:"Список доменов → кластеры «один хозяин»: общие ID аналитики, сертификаты, favicon, IP, NS/MX, регистрация, похожая вёрстка — с объяснением каждой связи",ph:"phish-1.com\nphish-2.net\n…",area:1,wide:1},
+ {id:"exposure",cat:"Информационная безопасность",ic:"🛡",tn:"Ваш цифровой след (самоаудит)",td:"Что любой узнает о вашей организации без взлома: почта, сайт, поддомены, порты и CVE, утечки, метаданные документов, архив. Оценка и чек-лист «что закрыть»",ph:"company.com  (и email через пробел)",wide:1},
+ {id:"pattern",cat:"OSINT: люди",ic:"🕰",tn:"Ритм жизни",td:"Тепловая карта активности → часовой пояс, сон, будни/выходные, аномальные недели. github:ник · reddit:ник · bsky:handle · @user@instance (Mastodon) — или вставьте свои временные метки",ph:"github:torvalds  ·  или список дат/unix-времени",area:1,wide:1},
  {id:"magic",cat:"Утилиты",ic:"🪄",tn:"Магия декодирования (как CyberChef)",td:"Сам подберёт цепочку: base64/32/58, hex, URL, ROT/Цезарь, XOR с перебором ключа, gzip/zlib, Морзе, JWT… Ручной рецепт: первая строка «recipe: b64 > gunzip > xor:0x2a»",ph:"вставьте непонятную строку",area:1,wide:1,file:1},
  {id:"img_forensics",cat:"Файлы и медиа",ic:"🔬",tn:"Криминалистика фото",td:"ELA (вклейки и правки), битовые плоскости (стеганография), миниатюра EXIF против фото, качество JPEG, следы редакторов",ph:"URL изображения (или выберите файл)",file:1,wide:1,accept:"image/*"},
  {id:"email_headers",cat:"Информационная безопасность",ic:"📨",tn:"Разбор email-заголовков",td:"Путь письма по серверам (и на глобусе), SPF/DKIM/DMARC, подмена отправителя и Reply-To, задержки",ph:"вставьте исходник письма («Показать оригинал») или выберите .eml",area:1,wide:1,file:1,accept:".eml,.txt,message/rfc822"},
@@ -1899,6 +2024,9 @@ function fmtAny(d,depth){depth=depth||0;if(d==null)return'<span class="mu">—</
  return esc(d)}
 const SEVC={"критический":"c","высокий":"h","средний":"m","инфо":"i"};
 function fmtTool(id,d,body){
+ if(id==="attribution")return attribView(d);
+ if(id==="exposure")return exposureView(d);
+ if(id==="pattern")return patternView(d);
  if(id==="magic")return magicView(d);
  if(id==="img_forensics")return forensicsView(d);
  if(id==="email_headers")return mailView(d);
@@ -2096,7 +2224,7 @@ function dl(kind){if(!cur)return;
  if(IOS){if(kind==="report")viewer(`/download/report?case=${cur.id}&t=${T}`,"Отчёт");else saveIOS(kind,cur.id);setTimeout(refresh,800);return}const a=document.createElement("a");a.href=`/download/${kind}?case=${cur.id}&t=${T}`;
  if(kind==="report")a.target="_blank";else a.download="";document.body.append(a);a.click();a.remove();setTimeout(refresh,800)}
 $("#rep").onclick=e=>{e.stopPropagation();if(!cur)return toast("Сначала выберите кейс","bad");const r=e.target.getBoundingClientRect();
- showMenu(r.left,r.bottom+6,[["Экспорт кейса",null],["📄 Отчёт HTML (откроется в браузере)",()=>dl("report")],["🧾 Пакет доказательств ZIP",()=>dl("evidence")],
+ showMenu(r.left,r.bottom+6,[["Экспорт кейса",null],["📄 Отчёт HTML (откроется в браузере)",()=>dl("report")],["🧾 Пакет доказательств ZIP",()=>dl("evidence")],["🔐 Проверяемый отчёт HTML (сам себя проверяет)",()=>dl("verify")],["⛓ Якоря в блокчейне…",openAnchors],
   ["{ } Весь кейс JSON",()=>dl("json")],["📊 Сущности CSV (Excel)",()=>dl("csv")],["Граф связей",null],
   ["🕸 GEXF — для Gephi",()=>dl("gexf")],["🕸 GraphML — yEd, Gephi, Cytoscape",()=>dl("graphml")],["🕸 Таблица связей CSV — Maltego",()=>dl("edges")],
   ["🖼 Картинка графа PNG",exportPng]])};
@@ -2119,6 +2247,7 @@ async function openSettings(){const s=await api("settings"),i=await api("info");
    <div class="hint">${IOS?"На iPhone скриншоты и PDF страниц пока недоступны — сохраняются HTML-снимок и SHA-256.":i.browser?"Браузер для снимков: "+esc(i.browser):"⚠ Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
   <div class="sec"><b>Метка времени RFC 3161 для пакета доказательств</b>
    ${chk("stsa",s.tsa_enabled,"Заверять manifest.json у независимой службы времени (TSA)")}
+   ${chk("sots",s.ots_enabled!==false,"Закреплять пакет в блокчейне Bitcoin (OpenTimestamps, бесплатно)")}
    <div class="frow"><label>Служба TSA</label><input id="stsau" placeholder="http://timestamp.digicert.com (по умолчанию)" value="${esc(s.tsa_url||"")}"></div></div>
   <div class="sec"><b>Прочее</b>${chk("supd",s.check_updates,"Проверять обновления на GitHub при запуске")}</div>
   <div class="sec"><b>Портативный режим</b><div class="hint">${i.portable?"✓ Включён: данные хранятся в папке ProvenioData рядом с программой.":"Данные в профиле пользователя: "+esc(i.data_dir)}</div>
@@ -2128,7 +2257,7 @@ async function openSettings(){const s=await api("settings"),i=await api("info");
  b.querySelector("#ssave").onclick=async()=>{const keys={};b.querySelectorAll(".skey").forEach(x=>keys[x.dataset.k]=x.value);
   const g=id=>b.querySelector(id);
   try{await api("settings",{proxy:g("#sproxy").value,timeout:+g("#stime").value||15,keys,ai_model:g("#smodel").value,
-   capture_screenshot:g("#scap").checked,capture_pdf:g("#spdf").checked,tsa_enabled:g("#stsa").checked,tsa_url:g("#stsau").value,check_updates:g("#supd").checked});
+   capture_screenshot:g("#scap").checked,capture_pdf:g("#spdf").checked,tsa_enabled:g("#stsa").checked,ots_enabled:g("#sots").checked,tsa_url:g("#stsau").value,check_updates:g("#supd").checked});
    toast("Настройки сохранены","ok");closeModal()}catch(x){toast(x.message,"bad")}};
  bindAccount(b);
  const sp=b.querySelector("#sport");if(sp)sp.onclick=async()=>{if(!confirm("Скопировать все данные в папку ProvenioData рядом с программой и включить портативный режим?"))return;
@@ -2443,6 +2572,8 @@ function gTick(t){requestAnimationFrame(gTick);if(tab!=="globe"||!GW)return;cons
   gx.beginPath();gx.moveTo(p.x,p.y-6);gx.lineTo(p.x+5,p.y);gx.lineTo(p.x,p.y+6);gx.lineTo(p.x-5,p.y);gx.closePath();gx.fill();gx.shadowBlur=0;
   gx.fillStyle="#f5d0fe";gx.font="11px Segoe UI";gx.textAlign="left";gx.fillText(o.label,p.x+8,p.y+4);GV.hits.push({x:p.x,y:p.y,l:"cas",o})}
  drawOverlays(now);
+ if(GV.puzzle&&GV.puzzle.length){gx.save();for(const x of GV.puzzle){const p=proj(x.lon,x.lat);if(p.z<=0)continue;gx.fillStyle="#f472b6";gx.shadowColor="#f472b6";gx.shadowBlur=10;
+  gx.beginPath();gx.arc(p.x,p.y,3.5,0,7);gx.fill()}gx.restore()}
  if(GV.mark){const p=proj(GV.mark.lon,GV.mark.lat);if(p.z>0){const ph=(now/1000)%1;gx.strokeStyle=`rgba(255,255,255,${1-ph})`;gx.lineWidth=1.5;gx.beginPath();gx.arc(p.x,p.y,4+ph*16,0,7);gx.stroke();
   gx.fillStyle="#fff";gx.font="600 12px Segoe UI";gx.textAlign="left";gx.fillText(GV.mark.label||"",p.x+10,p.y-8)}}
  if(sel){const pos=gPos(sel.l,sel.o,now),p=pos&&proj(pos.lon,pos.lat,sel.l==="sats"?1+pos.alt/RE:1);if(p&&p.vis){gx.strokeStyle="#fff";gx.lineWidth=1.5;gx.strokeRect(p.x-8,p.y-8,16,16)}}
@@ -2760,7 +2891,124 @@ function ctDraw(s){const l=$("#ctlive");if(!l)return;l.className="live"+(s.runni
   <div class="row" style="gap:6px;margin-top:5px">${m.domains.slice(0,3).map(d=>`<button class="ghost" style="padding:5px 10px" data-ctd="${esc(d.replace(/^\*\./,""))}">🎣 Проверить ${esc(d.replace(/^\*\./,""))}</button>`).join("")}</div></div>`).join(""):'<div class="pmsg">Пока пусто. Добавьте ключевые слова и запустите поток.</div>'}
 function ctBind(){const m=$("#ctmatch");if(m)m.onclick=e=>{const b=e.target.closest("[data-ctd]");if(b)ctCheck(b.dataset.ctd)}}
 function ctCheck(d){setTab("tools");setTimeout(()=>{const c=document.querySelector('.tool[data-id="phishing"]');if(!c)return;c.querySelector(".tq").value="https://"+d;runTool(c.querySelector(".tf-act"))},200)}
-$("#gchrono").onclick=chronoPanel;
+
+/* =================== 2.5: АТРИБУЦИЯ =================== */
+function attribView(d){const cl=d.clusters.map((c,i)=>`<div class="clu"><b class="n">Оператор ${i+1}</b> <span class="pmsg">· ${c.domains.length} домен(а) · сила связи ${Math.round(c.strength*100)}%</span>
+  <div>${c.domains.map(x=>`<span class="tag good">${esc(x)}</span>`).join("")}</div><div class="pmsg" style="margin-top:5px">Почему: ${esc(c.why.join(" · "))}</div></div>`).join("")||'<div class="flag">Общих операторов не найдено — домены выглядят независимыми.</div>';
+ return `<div class="row" style="gap:8px;margin-bottom:4px"><b>Найдено групп: ${d.clusters.length}</b><span class="pmsg">из ${d.domains.length} доменов</span></div>`+cl+
+  (d.alone.length?sec("Без связей",d.alone.map(x=>`<span class="tag">${esc(x)}</span>`).join("")):"")+
+  (d.pairs.length?sec("Все связи",tbl(["Пара","Сила","Признаки"],d.pairs.slice(0,40).map(p=>[`${esc(p.a)}<br>${esc(p.b)}`,`<b style="color:${p.score>=.55?"var(--ok)":"var(--mu)"}">${Math.round(p.score*100)}%</b>`,esc(p.reasons.join("; "))]))):"")+
+  `<div class="pmsg" style="margin-top:6px">${esc(d.method)}</div>`}
+
+/* =================== 2.5: САМОАУДИТ =================== */
+function exposureView(d){const C={critical:"#f43f5e",high:"#fb923c",medium:"#fbbf24",low:"#60a5fa"},L={critical:"критично",high:"высокий",medium:"средний",low:"низкий"},col=d.score>=50?"#f43f5e":d.score>=20?"#fbbf24":"#34d399";
+ return `<div class="score"><div class="ring" style="--c:${col};--p:${d.score}"><b>${d.score}</b></div><div><b style="font-size:16px">Открытость: ${esc(d.level)}</b><div class="pmsg">${esc(d.domain)}${d.emails.length?" · "+esc(d.emails.join(", ")):""} · поддоменов ${d.subdomains} · документов проверено ${d.docs_checked}</div></div></div>`+
+  (d.findings.length?d.findings.map(f=>`<div class="fnd"><span class="sv" style="color:${C[f.sev]}">${L[f.sev]}</span><div><b>${esc(f.area)}:</b> ${esc(f.text)}<div class="fx2">✔ ${esc(f.fix)}</div></div></div>`).join(""):'<div class="flag ok">Явных проблем не найдено.</div>')+
+  `<div class="pmsg" style="margin-top:6px">${esc(d.note)}</div>`}
+
+/* =================== 2.5: РИТМ ЖИЗНИ =================== */
+const DOW=["Пн","Вт","Ср","Чт","Пт","Сб","Вс"];
+function patternView(d){const id="pl"+Math.random().toString(36).slice(2,7);const off=d.utc_offset;
+ const draw=(local)=>{const h=d.heat_utc;let mx=1;h.forEach(r=>r.forEach(v=>mx=Math.max(mx,v)));let g=`<i></i>${[...Array(24).keys()].map(x=>`<i>${x}</i>`).join("")}`;
+  for(let w=0;w<7;w++){g+=`<i>${DOW[w]}</i>`;for(let x=0;x<24;x++){const src=local?(x-off+24)%24:x;const v=h[w][src],a=v/mx;g+=`<span title="${DOW[w]} ${x}:00 — ${v}" style="background:rgba(167,123,255,${(.06+a*.94).toFixed(2)});box-shadow:${a>.6?"0 0 10px rgba(167,123,255,.6)":"none"}"></span>`}}return g};
+ setTimeout(()=>{const t=document.getElementById(id+"t");if(t)t.onchange=()=>{document.getElementById(id).innerHTML=draw(t.checked)}},20);
+ const tz=`UTC${off>=0?"+":""}${off}`;
+ return `<div class="score"><div class="ring" style="--c:#a78bfa;--p:${d.confidence}"><b>${d.confidence}%</b></div><div><b style="font-size:16px">Вероятный часовой пояс: ${tz}</b>
+  <div class="pmsg">${esc(d.tz_examples)} · уверенность ${d.confidence}% (±1–2 ч) · ${d.events} событий · ${esc(d.first)} — ${esc(d.last)}</div></div></div>`+
+  kv("Сон (местное время)",`${d.sleep_local[0]}:00 — ${d.sleep_local[1]}:00`)+kv("Пик активности",`${d.peak_local}:00 местного`)+
+  kv("Выходные / будни",d.weekend_ratio==null?"—":`${d.weekend_ratio} ${d.weekend_ratio<.6?"— активность в основном в будни (работа?)":d.weekend_ratio>1.3?"— больше в выходные (хобби?)":""}`)+
+  (d.url?kv("Источник",d.url):"")+
+  `<label class="pmsg" style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="${id}t"> показать по местному времени (${tz})</label>
+  <div class="heat" id="${id}">${draw(false)}</div>`+
+  (d.anomalies.length?sec("Аномальные недели",d.anomalies.map(a=>`<div class="flag warn">${esc(a.week)}: режим сдвинут на ${a.shift_h>0?"+":""}${a.shift_h} ч (${a.events} событий) — поездка, смена режима или другой человек</div>`).join("")):"")+
+  `<div class="pmsg">${esc(d.note)}</div>`}
+
+/* =================== 2.5: ЯКОРЯ, СВИДЕТЕЛЬ, ПРОВЕРЯЕМЫЙ ОТЧЁТ =================== */
+async function openAnchors(){if(!cur)return toast("Сначала выберите кейс","bad");let L;try{L=await api("anchors?case="+cur.id)}catch(x){return toast(x.message,"bad")}
+ const b=modal("⛓ Якоря в блокчейне Bitcoin",`<div class="hint" style="margin-bottom:10px">Хэш журнала аудита кейса записывается в календари <b>OpenTimestamps</b>, а они раз в несколько часов
+  заносят его в блокчейн Bitcoin. После подтверждения любой человек сможет доказать, что все собранные доказательства существовали в этот момент и с тех пор не менялись —
+  не доверяя ни вам, ни нам. Бесплатно и без ключей; в сеть уходит только хэш.</div>
+  <div class="row" style="gap:8px;margin-bottom:8px"><button class="btn" id="anew">⛓ Закрепить кейс сейчас</button><button class="ghost" id="arep">🔐 Проверяемый отчёт HTML</button></div>
+  <div id="alist">${L.map(anchorRow).join("")||'<div class="pmsg">Якорей пока нет. Они создаются и автоматически при экспорте пакета доказательств.</div>'}</div>`);
+ b.onclick=async e=>{const t=e.target;
+  if(t.id==="anew"){t.classList.add("loading");try{const r=await api("anchor",{case:cur.id});toast(`Отправлено в ${r.calendars.length} календаря OpenTimestamps`,"ok");openAnchors()}catch(x){toast(x.message,"bad")}finally{t.classList.remove("loading")}}
+  if(t.id==="arep")dl("verify");
+  if(t.dataset.ach){t.classList.add("loading");try{const r=await api("anchor_check",{id:+t.dataset.ach});toast(r.status==="confirmed"?`Подтверждено: блок ${r.height}`:"Пока ждёт блок Bitcoin (обычно 1–12 ч)",r.status==="confirmed"?"ok":"");openAnchors()}catch(x){toast(x.message,"bad")}}
+  if(t.dataset.aots){const a=document.createElement("a");a.href=`/download/ots?id=${t.dataset.aots}&t=${T}`;a.download="";document.body.append(a);a.click();a.remove()}}}
+function anchorRow(a){return `<div class="anc ${a.status}"><span class="st">${a.status==="confirmed"?"✓ В блокчейне":"⏳ Ожидает блок"}</span>
+ <div class="grow"><b>${a.kind==="evidence"?"Пакет доказательств":"Журнал кейса"}</b> · ${esc(a.created)}${a.height?` · блок <b>${a.height}</b> (${esc(a.block_time)})`:""}<br><code style="font-size:11px">${esc(a.digest)}</code></div>
+ <button class="ghost" data-ach="${a.id}">Проверить</button><button class="ghost" data-aots="${a.id}">⬇ .ots</button></div>`}
+
+/* =================== 2.5: МАТРИЦА ГИПОТЕЗ (ACH) =================== */
+const ACHV=["","CC","C","N","I","II"],ACHN={"":"—",CC:"++ очень согласуется",C:"+ согласуется",N:"нейтрально",I:"− противоречит",II:"−− сильно противоречит"};
+const RELW={L:.5,M:1,H:1.5};let ACH=null,ACHT=null;
+async function openAch(){if(!cur)return toast("Сначала выберите кейс","bad");const r=await api("ach?case="+cur.id);
+ ACH=r.data||{hyps:[{id:1,text:"Гипотеза А"},{id:2,text:"Гипотеза Б"}],ev:[],cells:{}};
+ modal("⚖ Матрица конкурирующих гипотез",`<div class="hint" style="margin-bottom:8px">Метод аналитиков разведки (ACH): побеждает не та версия, которую больше всего подтверждают,
+  а та, которой <b>меньше всего противоречат</b> улики. Отметьте для каждой улики, как она соотносится с каждой гипотезой. Надёжность улики берётся из надёжности источника.</div>
+  <div class="row" style="gap:7px;margin-bottom:8px"><button class="ghost" id="ah">＋ Гипотеза</button><button class="ghost" id="ae">＋ Улика</button><button class="ghost" id="as">⇩ Улики из источников кейса</button>
+  <span class="pmsg grow" id="ast">${r.updated?"сохранено "+esc(r.updated):""}</span></div><div class="ach" id="achbox"></div>
+  <div class="pmsg" style="margin-top:8px">⚪ Бледные улики ничего не различают (одинаковы для всех версий). 🟡 Отмеченные слева — на них держится вывод: без любой из них лидер меняется.</div>`);
+ document.querySelector(".modal").style.width="min(1280px,96vw)";achDraw();const box=document.querySelector(".modal .mb");
+ box.onclick=e=>{const t=e.target;if(t.id==="ah"){ACH.hyps.push({id:Date.now(),text:"Новая гипотеза"});achChanged()}
+  if(t.id==="ae"){ACH.ev.push({id:Date.now(),text:"",cred:3,rel:"M"});achChanged()}
+  if(t.id==="as"&&st){const have=new Set(ACH.ev.map(e=>e.src));st.sources.filter(s=>!have.has(s.id)).forEach(s=>ACH.ev.push({id:Date.now()+s.id,src:s.id,text:`#${s.id} ${s.title||s.url}`,cred:s.reliability,rel:"M"}));achChanged()}
+  if(t.dataset.delh){ACH.hyps=ACH.hyps.filter(h=>h.id!=t.dataset.delh);achChanged()}
+  if(t.dataset.dele){ACH.ev=ACH.ev.filter(x=>x.id!=t.dataset.dele);achChanged()}};
+ box.onchange=box.oninput=e=>{const t=e.target,d=t.dataset;
+  if(d.h)ACH.hyps.find(h=>h.id==d.h).text=t.value;
+  if(d.e)ACH.ev.find(x=>x.id==d.e)[d.f]=d.f==="cred"?+t.value:t.value;
+  if(d.ce){(ACH.cells[d.ce]=ACH.cells[d.ce]||{})[d.ch]=t.value}
+  if(e.type==="change"&&(d.ce||d.f==="cred"||d.f==="rel"))achDraw(true);achSave()}}
+function achChanged(){achDraw();achSave()}
+function achSave(){clearTimeout(ACHT);ACHT=setTimeout(async()=>{try{const r=await api("ach",{case:cur.id,data:ACH});const s=$("#ast");if(s)s.textContent="сохранено "+r.updated}catch(x){}},600)}
+function achScore(ev){const s={};ACH.hyps.forEach(h=>s[h.id]=0);for(const e of ev){const w=(e.cred||3)/5*(RELW[e.rel]||1),c=ACH.cells[e.id]||{};
+  for(const h of ACH.hyps){const v=c[h.id];if(v==="I")s[h.id]+=w;if(v==="II")s[h.id]+=2*w}}return s}
+function achBest(s){let b=null;for(const h of ACH.hyps)if(b===null||s[h.id]<s[b])b=h.id;return b}
+function achDraw(keepFocus){const box=$("#achbox");if(!box)return;const s=achScore(ACH.ev),best=achBest(s);
+ const sens=new Set(ACH.ev.filter(e=>achBest(achScore(ACH.ev.filter(x=>x!==e)))!==best&&ACH.hyps.length>1).map(e=>e.id));
+ const nd=e=>{const c=ACH.cells[e.id]||{},vals=ACH.hyps.map(h=>c[h.id]||"");return vals.every(v=>v===vals[0])};
+ if(keepFocus){box.querySelectorAll("tfoot td[data-s]").forEach(td=>{const id=td.dataset.s;td.textContent=s[id].toFixed(1);td.className=id==best?"best":""});
+  box.querySelectorAll("tr[data-row]").forEach(tr=>{const e=ACH.ev.find(x=>x.id==tr.dataset.row);tr.className=(nd(e)?"nd ":"")+(sens.has(e.id)?"sens":"")});
+  box.querySelectorAll("select[data-ce]").forEach(x=>x.parentElement.className="c-"+(x.value||"x"));return}
+ box.innerHTML=`<table><thead><tr><th>Улика</th><th>Надёжн.</th><th>Важн.</th>${ACH.hyps.map(h=>`<th><div class="row" style="gap:4px;flex-wrap:nowrap"><input data-h="${h.id}" value="${esc(h.text)}"><button class="ghost" style="padding:3px 7px" data-delh="${h.id}">✕</button></div></th>`).join("")}<th></th></tr></thead>
+ <tbody>${ACH.ev.map(e=>`<tr data-row="${e.id}" class="${nd(e)?"nd ":""}${sens.has(e.id)?"sens":""}"><td class="ev"><input data-e="${e.id}" data-f="text" value="${esc(e.text)}" placeholder="Факт или улика…"></td>
+  <td><select data-e="${e.id}" data-f="cred">${[1,2,3,4,5].map(n=>`<option ${n==e.cred?"selected":""}>${n}</option>`).join("")}</select></td>
+  <td><select data-e="${e.id}" data-f="rel">${["L","M","H"].map(n=>`<option value="${n}" ${n==e.rel?"selected":""}>${{L:"низкая",M:"средняя",H:"высокая"}[n]}</option>`).join("")}</select></td>
+  ${ACH.hyps.map(h=>{const v=(ACH.cells[e.id]||{})[h.id]||"";return `<td class="c-${v||"x"}"><select data-ce="${e.id}" data-ch="${h.id}">${ACHV.map(o=>`<option value="${o}" ${o===v?"selected":""}>${ACHN[o]}</option>`).join("")}</select></td>`}).join("")}
+  <td><button class="ghost" style="padding:3px 7px" data-dele="${e.id}">✕</button></td></tr>`).join("")||`<tr><td colspan="${ACH.hyps.length+4}" class="pmsg">Добавьте улики — вручную или из источников кейса.</td></tr>`}</tbody>
+ <tfoot><tr><td colspan="3">Противоречий (меньше — вероятнее)</td>${ACH.hyps.map(h=>`<td data-s="${h.id}" class="${h.id==best?"best":""}">${s[h.id].toFixed(1)}</td>`).join("")}<td></td></tr></tfoot></table>`}
+
+/* =================== 2.5: ГЕОПАЗЛ =================== */
+let GPF=null;
+async function geoPuzzlePanel(){if(!GPF)try{GPF=await api("geopuzzle_features")}catch(x){return toast(x.message,"bad")}
+ const el=$("#ginfo");el.classList.add("show");GV.sel=null;const opts=GPF.map(f=>`<option value="${f.id}">${esc(f.label)}</option>`).join("");
+ el.innerHTML=`<h4>🧩 Геопазл<button class="x">✕</button></h4><div class="gp"><div class="pmsg">Опишите, что видно на фото — Provenio найдёт в OpenStreetMap места, где всё это есть рядом.</div>
+  <label>Где искать (город, район) — или пусто: текущий вид глобуса<input id="gp-area" placeholder="например: Казань"></label>
+  <label>Главная примета<select id="gp-a">${opts}</select></label><input id="gp-ac" placeholder="свой тег: key=value" hidden>
+  <label>Название содержит (необязательно)<input id="gp-n" placeholder="например: Никол"></label>
+  <div class="pmsg" style="margin-top:6px">…а рядом с ней (в пределах, м):</div><div id="gp-c"></div>
+  <button class="ghost" id="gp-add" style="margin:4px 0">＋ примета рядом</button>
+  <div class="row" style="gap:6px;margin-top:4px"><button class="btn" id="gp-go" style="padding:8px 14px">Найти места</button><button class="ghost" id="gp-clr">✕</button></div>
+  <div class="pmsg" id="gp-msg" style="margin-top:6px"></div><div class="gpres" id="gp-res"></div></div>`;
+ const addRow=(k="river",d=300)=>{const r=document.createElement("div");r.className="cr";r.innerHTML=`<select>${opts}</select><input type="number" value="${d}" min="10" max="5000"><button class="ghost" style="padding:3px 7px">✕</button>`;
+  r.querySelector("select").value=k;r.querySelector("button").onclick=()=>r.remove();$("#gp-c").append(r)};
+ addRow("river",300);$("#gp-add").onclick=()=>{if($$("#gp-c .cr").length<4)addRow("fuel",500)};
+ $("#gp-a").onchange=e=>{$("#gp-ac").hidden=e.target.value!=="custom"};
+ $("#gp-clr").onclick=()=>{GV.puzzle=null;$("#gp-res").innerHTML="";$("#gp-msg").textContent=""};
+ $("#gp-go").onclick=async e=>{const b=e.target,area=$("#gp-area").value.trim();let bbox=null;
+  if(!area){const span=Math.max(.05,Math.min(1.2,30/GV.zoom));bbox=[GV.lat-span,GV.lon-span*1.6,GV.lat+span,GV.lon+span*1.6]}
+  const cons=$$("#gp-c .cr").map(r=>({key:r.querySelector("select").value,dist:+r.querySelector("input").value}));
+  b.classList.add("loading");$("#gp-msg").textContent="Ищу в OpenStreetMap…";
+  try{const j=await api("geopuzzle",{area,bbox,anchor:$("#gp-a").value,anchor_custom:$("#gp-ac").value,name:$("#gp-n").value,constraints:cons});
+   const f=await waitJob(j.id);if(f.state!=="done")throw new Error(f.error||"не удалось");const d=f.result;GV.puzzle=d.items;
+   $("#gp-msg").innerHTML=d.count?`Кандидатов: <b>${d.count}</b>${d.count>=150?" (показаны первые 150 — уточните)":""}. ${esc(d.note)}`:"Мест с таким сочетанием нет — ослабьте условия или увеличьте расстояния.";
+   $("#gp-res").innerHTML=d.items.map((x,i)=>`<div data-gi="${i}">📍 ${esc(x.name||"без названия")} <span class="mu">${x.lat.toFixed(4)}, ${x.lon.toFixed(4)}</span></div>`).join("");
+   $("#gp-res").onclick=ev=>{const r=ev.target.closest("[data-gi]");if(!r)return;const x=d.items[+r.dataset.gi];globeGo(x.lon,x.lat,x.name||"кандидат");GV.zoom=Math.max(GV.zoom,40);
+    showMenu(ev.clientX,ev.clientY,[["Открыть",null],["🗺 OpenStreetMap",()=>window.open(x.osm,"_blank")],["🚶 Панорама Google",()=>window.open(x.gmaps,"_blank")],["🛰 Спутник Яндекса",()=>window.open(x.yandex,"_blank")]])};
+   if(d.items.length){const c=d.items[0];GV.fly={lon:c.lon,lat:c.lat};GV.auto=false;$("#gauto").checked=false;GV.zoom=Math.max(GV.zoom,25)}}
+  catch(x){$("#gp-msg").textContent="⚠ "+x.message}finally{b.classList.remove("loading")}}}
+$("#gchrono").onclick=chronoPanel;$("#gpuzzle").onclick=geoPuzzlePanel;$("#achb").onclick=openAch;$("#ancb").onclick=openAnchors;
 $("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
 setInterval(async()=>{if(!ME)return;try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
 window.addEventListener("load",showAuth);

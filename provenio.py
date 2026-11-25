@@ -38,7 +38,7 @@ import urllib.error
 from html.parser import HTMLParser
 
 APP_NAME = "Provenio"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 # каталог с ресурсами (в exe PyInstaller распаковывает их во временную папку)
@@ -413,6 +413,10 @@ class Store:
             id INTEGER PRIMARY KEY, case_id INTEGER, domain TEXT, interval_min INTEGER,
             last_check TEXT DEFAULT '', next_ts REAL DEFAULT 0, baseline TEXT DEFAULT '',
             changes INTEGER DEFAULT 0, UNIQUE(case_id, domain));
+        CREATE TABLE IF NOT EXISTS anchors(
+            id INTEGER PRIMARY KEY, case_id INTEGER, created TEXT, kind TEXT, subject TEXT, digest TEXT,
+            proof BLOB, status TEXT DEFAULT 'pending', height INTEGER, block_time TEXT);
+        CREATE TABLE IF NOT EXISTS ach(case_id INTEGER PRIMARY KEY, data TEXT, updated TEXT);
         """)
         # миграция схемы 1.x -> 2.x: новые поля источников
         have = {r[1] for r in self.db.execute("PRAGMA table_info(sources)")}
@@ -558,6 +562,46 @@ class Store:
         for r in rows:
             out.setdefault(r["source_id"], []).append(r)
         return out
+
+    # --- 2.5: якоря во времени (OpenTimestamps) и матрица гипотез
+    def add_anchor(self, case_id, kind, subject, digest, proof):
+        with self.lock:
+            cur = self.db.execute("INSERT INTO anchors(case_id,created,kind,subject,digest,proof) VALUES(?,?,?,?,?,?)",
+                                  (case_id, now_iso(), kind, subject, digest, proof))
+            self.db.commit()
+            self.audit("anchor_created", f"case={case_id} {kind} sha256={digest} (OpenTimestamps)")
+            return cur.lastrowid
+
+    def anchors(self, case_id=None, pending_only=False):
+        q = "SELECT * FROM anchors WHERE 1=1" + (" AND case_id=?" if case_id else "") + \
+            (" AND status=?" if pending_only else "") + " ORDER BY id DESC"
+        args = ((case_id,) if case_id else ()) + (("pending",) if pending_only else ())
+        with self.lock:
+            return [dict(r) for r in self.db.execute(q, args)]
+
+    def update_anchor(self, aid, proof, status, height=None, block_time=None):
+        with self.lock:
+            self.db.execute("UPDATE anchors SET proof=?, status=?, height=?, block_time=? WHERE id=?",
+                            (proof, status, height, block_time, aid))
+            self.db.commit()
+            if status == "confirmed":
+                self.audit("anchor_confirmed", f"anchor={aid} bitcoin block {height} {block_time or ''}")
+
+    def ach_get(self, case_id):
+        with self.lock:
+            r = self.db.execute("SELECT data, updated FROM ach WHERE case_id=?", (case_id,)).fetchone()
+        return (json.loads(r["data"]), r["updated"]) if r else (None, None)
+
+    def ach_set(self, case_id, data):
+        blob = json.dumps(data, ensure_ascii=False)
+        if len(blob) > 2_000_000:
+            raise ValueError("Слишком большая матрица")
+        with self.lock:
+            self.db.execute("INSERT INTO ach(case_id,data,updated) VALUES(?,?,?) "
+                            "ON CONFLICT(case_id) DO UPDATE SET data=excluded.data, updated=excluded.updated",
+                            (case_id, blob, now_iso()))
+            self.db.commit()
+            self.audit("ach_saved", f"case={case_id} гипотез={len(data.get('hyps') or [])} улик={len(data.get('ev') or [])}")
 
     def page_links(self, sid):
         """Абсолютные http(s)-ссылки из сохранённого снимка страницы."""
@@ -1220,7 +1264,7 @@ def rfc3161_stamp(digest, tsa_url=TSA_DEFAULT, timeout=25):
 
 
 
-def build_evidence_zip(store, case, tsa_url=None):
+def build_evidence_zip(store, case, tsa_url=None, ots=None):
     """tsa_url — адрес службы меток времени RFC 3161: хэш manifest.json заверяется
     независимой третьей стороной (доказывает, что пакет существовал не позже этого момента)."""
     srcs = store.sources(case["id"])
@@ -1262,6 +1306,17 @@ def build_evidence_zip(store, case, tsa_url=None):
         z.writestr("README.txt", EVIDENCE_README)
         for path, data in blobs.items():
             z.writestr(path, data)
+        if ots:
+            try:
+                proof, cals = ots(hashlib.sha256(mbytes).digest())
+                z.writestr("timestamp/manifest.ots", proof)
+                z.writestr("timestamp/OPENTIMESTAMPS.txt",
+                           "manifest.ots — доказательство OpenTimestamps: SHA-256 файла manifest.json записан в календари\n"
+                           f"{', '.join(cals)} и через несколько часов попадёт в блокчейн Bitcoin.\n"
+                           "Проверка: https://opentimestamps.org (перетащите manifest.ots и manifest.json) или `ots verify manifest.ots`.\n")
+                store.add_anchor(case["id"], "evidence", "manifest.json", hashlib.sha256(mbytes).hexdigest(), proof)
+            except Exception as e:
+                z.writestr("timestamp/OPENTIMESTAMPS.txt", f"Якорь OpenTimestamps не получен: {type(e).__name__}: {e}\n")
         if ts and ts.get("token"):
             z.writestr("timestamp/manifest.tsq", ts["request"])
             z.writestr("timestamp/manifest.tsr", ts["token"])
@@ -1336,7 +1391,7 @@ def _dpapi(data, protect):
 
 SECRET_KEYS = ("shodan", "virustotal", "abuseipdb", "urlscan", "otx", "github", "anthropic")
 OPTIONS = {"capture_screenshot": True, "capture_pdf": False, "tsa_enabled": True, "tsa_url": "",
-           "check_updates": False, "ai_model": "claude-opus-5-5"}
+           "check_updates": False, "ai_model": "claude-opus-5-5", "ots_enabled": True}
 
 
 def load_settings():

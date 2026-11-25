@@ -5,7 +5,7 @@
 [tool.briefcase]
 project_name = "Provenio"
 bundle = "io.github.nzikach"
-version = "2.4.0"
+version = "2.5.0"
 url = "https://github.com/nzikach/Provenio-OSINT-Tool"
 license = "LicenseRef-Proprietary"
 license-files = ["LICENSE"]

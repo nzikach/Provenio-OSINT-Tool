@@ -33,6 +33,8 @@
 | Криптовалюта | Blockstream, mempool.space, Blockscout |
 | Глобус | OpenSky Network, airplanes.live, CelesTrak, USGS, NASA EONET, OpenStreetMap Nominatim |
 | Угрозы | ransomware.live (поиск жертв вымогателей — уходит только ваш запрос), журналы Certificate Transparency Let's Encrypt и список логов Google (CT-поток — только скачивание, о вас ничего не передаётся; ~90 МБ/ч, пока поток включён) |
+| Доказательства (2.5) | календари OpenTimestamps (a/b.pool.opentimestamps.org, eternitywall — уходит только SHA-256), blockstream.info (проверка блока Bitcoin), Internet Archive Save Page Now (независимый свидетель — URL страницы) |
+| Карты и активность (2.5) | OpenStreetMap Overpass API (геопазл — область и приметы), публичные API GitHub, Reddit, Bluesky, Mastodon (ритм жизни — только указанный вами ник) |
 | Доказательства | службы времени RFC 3161: DigiCert, Sectigo, FreeTSA, SSL.com (только хэш) |
 | ИИ | Anthropic API* (только по кнопке, с предупреждением) |
 | Обновления | api.github.com (только если включено) |
