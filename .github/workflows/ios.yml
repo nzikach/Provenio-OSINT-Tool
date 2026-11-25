@@ -62,6 +62,7 @@ jobs:
           xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="-" EXPANDED_CODE_SIGN_IDENTITY_NAME="ad-hoc" \
             build > ../xcode.log 2>&1
           CODE=$?
           set -e
