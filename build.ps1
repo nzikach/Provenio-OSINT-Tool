@@ -37,6 +37,7 @@ if ($LASTEXITCODE -ne 0) { throw "Тесты не прошли — сборка 
     --add-data "provenio_sites.json;." `
     --add-data "assets\world-110m.json;assets" `
     --add-data "legal;legal" `
+    --add-data "assets\provenio.png;assets" `
     --exclude-module tkinter `
     --exclude-module unittest `
     --collect-all webview `

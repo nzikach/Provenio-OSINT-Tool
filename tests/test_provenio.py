@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import sys
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -618,6 +619,74 @@ class UniqueTests(unittest.TestCase):
         self.assertEqual(U._dom("https://www.Example.com/path"), "example.com")
         with self.assertRaises(ValueError):
             U.attribution("one.com")
+
+
+class LanTests(unittest.TestCase):
+    def test_qr_structure(self):
+        import provenio_lan as L
+        for text, size in (("HELLO", 21), ("x" * 60, 33), ("y" * 200, 57)):
+            g = L.qr_matrix(text)
+            self.assertEqual(len(g), size)
+            for r, c in ((0, 0), (0, size - 7), (size - 7, 0)):          # три поисковых узора 7×7
+                self.assertTrue(all(g[r][c + i] and g[r + 6][c + i] and g[r + i][c] and g[r + i][c + 6] for i in range(7)))
+                self.assertTrue(g[r + 3][c + 3])
+            self.assertTrue(g[size - 8][8])                               # «тёмный модуль»
+        self.assertIn("<svg", L.qr_svg("http://192.168.1.2:48765/?k=abc"))
+        with self.assertRaises(ValueError):
+            L.qr_matrix("z" * 400)
+        self.assertTrue(L.is_local_client("192.168.1.5"))
+        self.assertTrue(L.is_local_client("10.0.0.7"))
+        self.assertFalse(L.is_local_client("8.8.8.8"))
+
+    def test_lan_access_rules(self):
+        import http.client
+        import provenio_lan as LM
+        import provenio_ui as U
+        ip = LM.lan_ip()
+        if ip.startswith("127.") or not LM.is_local_client(ip):
+            self.skipTest("нет локальной сети")
+        st = U.lan_api({"action": "start"})
+        try:
+            self.assertTrue(st["on"])
+            self.assertIn(st["url"].split("?k=")[1], st["url"])
+            host, key = f"{st['ip']}:{st['port']}", st["url"].split("?k=")[1]
+
+            def req(path, h=host, method="GET", body=None, tok=None):
+                c = http.client.HTTPConnection(st["ip"], st["port"], timeout=10)
+                hd = {"Host": h, "Content-Type": "application/json"}
+                if tok:
+                    hd["X-Token"] = tok
+                c.request(method, path, body=json.dumps(body).encode() if body is not None else None, headers=hd)
+                r = c.getresponse()
+                return r.status, r.read().decode("utf-8", "replace")
+            self.assertEqual(req("/?k=" + key, h="evil.example")[0], 403)    # чужой Host (DNS rebinding)
+            code, page = req("/")
+            self.assertEqual(code, 403)                                      # без ключа — только подсказка
+            self.assertIn("QR", page)
+            code, page = req("/?k=" + key)
+            self.assertEqual(code, 200)
+            self.assertIn('rel="manifest"', page)
+            self.assertIn('PLAT="lan"', page)
+            self.assertEqual(req(f"/manifest.webmanifest?k={key}")[0], 200)
+            tok_page = re.search(r'PAGE_T="([^"]+)"', page).group(1)
+            self.assertEqual(req("/api/cases", tok=tok_page)[0], 401)       # до входа — ничего
+            if not U.ACC.exists():
+                U.ACC.register("lanuser", "Str0ng-pass!", "Str0ng-pass!", "1990-01-01", True, True)
+                self.addCleanup(os.remove, U.ACC.path)        # следующий тест ждёт «чистую» установку
+                pw, name = "Str0ng-pass!", "lanuser"
+            else:
+                self.skipTest("аккаунт уже создан другим тестом")
+            code, body = req("/api/auth/login", method="POST", body={"username": name, "password": pw}, tok=tok_page)
+            self.assertEqual(code, 200)
+            phone = json.loads(body)["token"]
+            self.assertEqual(req("/api/cases", tok=phone)[0], 200)
+            self.assertTrue(U.SESSIONS[phone]["lan"])
+            U.lan_api({"action": "rotate"})                                  # смена ключа выкидывает телефоны
+            self.assertNotIn(phone, U.SESSIONS)
+            self.assertEqual(req("/?k=" + key)[0], 403)
+        finally:
+            U.lan_api({"action": "stop"})
+        self.assertFalse(U.lan_api({})["on"])
 
 
 class UITests(unittest.TestCase):

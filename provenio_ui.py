@@ -28,13 +28,14 @@ import provenio_plus as X   # 2.1: фишинг, IP-радар, утечки, г
 import provenio_auth as A   # 2.2: локальная учётная запись
 import provenio_labs as XL  # 2.3: XSS-лаборатория (отдельный сервер, другой origin)
 import provenio_sec as SEC  # 2.4: магия, криминалистика фото, email, вымогатели, CT-поток
+import provenio_lan as LANM  # 2.6: интерфейс на телефоне через домашнюю сеть
 import provenio_unique as UQ  # 2.5: якоря OpenTimestamps, свидетель, атрибуция, геопазл, самоаудит, ритм жизни
 import hashlib
 
 S = P.Store()
 LOCK = S.lock
 TOKEN = secrets.token_urlsafe(24)       # токен страницы: до входа открывает только вход/регистрацию и документы
-SESSION = {"tok": None, "user": None}    # токен сеанса после входа: нужен для всех остальных запросов
+SESSIONS = {}                            # токены сеансов после входа (компьютер и телефоны): {токен: {user, lan}}
 ACC = A.Accounts(os.path.join(P.DATA_DIR, "account.json"))
 LEGAL_DOCS = {"terms": "TERMS.md", "privacy": "PRIVACY.md", "refund": "REFUND.md", "thirdparty": "THIRD_PARTY.md"}
 TL.configure(P.load_settings())
@@ -290,6 +291,11 @@ def monitor_loop():
         sec_init()
     except Exception:
         traceback.print_exc()
+    try:
+        if lan_cfg().get("autostart"):
+            lan_start()
+    except Exception:
+        traceback.print_exc()
     while True:
         time.sleep(30)
         threading.Thread(target=SEC.RW.check, daemon=True).start()   # сама решает, пора ли (раз в 6 ч)
@@ -304,6 +310,86 @@ def monitor_loop():
         if time.time() - last_brand > 120:
             last_brand = time.time()
             threading.Thread(target=brand_loop_once, daemon=True).start()
+
+
+# ----------------------------------------------------------------- 2.6: «Открыть на телефоне» (домашняя сеть)
+LAN = {"srv": None, "ip": None, "port": None}
+
+
+def lan_cfg():
+    try:
+        with open(os.path.join(P.DATA_DIR, "lan.json"), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if not d.get("key"):
+        d["key"] = secrets.token_urlsafe(18)
+    d.setdefault("port", 48765)
+    d.setdefault("autostart", False)
+    return d
+
+
+def lan_save(d):
+    os.makedirs(P.DATA_DIR, exist_ok=True)
+    with open(os.path.join(P.DATA_DIR, "lan.json"), "w", encoding="utf-8") as f:
+        json.dump(d, f)
+
+
+def lan_url(d=None):
+    d = d or lan_cfg()
+    return f"http://{LAN['ip']}:{LAN['port']}/?k={d['key']}" if LAN["srv"] else ""
+
+
+def lan_start():
+    if LAN["srv"]:
+        return
+    d = lan_cfg()
+    ip = LANM.lan_ip()
+    if ip.startswith("127."):
+        raise ValueError("Компьютер не подключён к локальной сети (Wi-Fi или кабель)")
+    try:
+        srv = ThreadingHTTPServer((ip, int(d["port"])), LanHandler)
+    except OSError:
+        srv = ThreadingHTTPServer((ip, 0), LanHandler)        # порт занят — берём любой и запоминаем
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    LAN.update(srv=srv, ip=ip, port=srv.server_address[1])
+    d["port"] = LAN["port"]
+    lan_save(d)
+    S.audit("lan_on", f"http://{ip}:{LAN['port']}/")
+
+
+def lan_stop():
+    srv = LAN["srv"]
+    if srv:
+        LAN.update(srv=None)
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+        for t in [t for t, s in SESSIONS.items() if s.get("lan")]:
+            SESSIONS.pop(t, None)                       # телефоны выходят из аккаунта
+        S.audit("lan_off", "")
+
+
+def lan_api(body):
+    a = body.get("action")
+    d = lan_cfg()
+    if a == "start":
+        lan_start()
+    elif a == "stop":
+        lan_stop()
+    elif a == "rotate":
+        d["key"] = secrets.token_urlsafe(18)
+        lan_save(d)
+        for t in [t for t, s in SESSIONS.items() if s.get("lan")]:
+            SESSIONS.pop(t, None)
+        S.audit("lan_key_rotated", "")
+    elif a == "autostart":
+        d["autostart"] = bool(body.get("value"))
+        lan_save(d)
+    d = lan_cfg()
+    url = lan_url(d)
+    return {"on": bool(LAN["srv"]), "url": url, "ip": LAN["ip"], "port": LAN["port"], "autostart": d["autostart"],
+            "qr": LANM.qr_svg(url, scale=5) if url else "",
+            "phones": sum(1 for s in SESSIONS.values() if s.get("lan"))}
 
 
 # ----------------------------------------------------------------- 2.5: якоря, свидетель, гипотезы, геопазл
@@ -416,13 +502,17 @@ def legal_doc(name):
         return {"name": name, "text": f.read()}
 
 
-def new_session(user):
-    SESSION["tok"] = secrets.token_urlsafe(32)
-    SESSION["user"] = user["username"]
-    return {"token": SESSION["tok"], "user": user}
+def new_session(user, lan=False):
+    tok = secrets.token_urlsafe(32)
+    SESSIONS[tok] = {"user": user["username"], "lan": lan, "created": time.time()}
+    return {"token": tok, "user": user}
 
 
-def auth_api(path, body, logged_in):
+def current_user():
+    return ACC.public().get("username", "")
+
+
+def auth_api(path, body, logged_in, lan=False):
     """Запросы, доступные до входа (с токеном страницы)."""
     if path == "auth/status":
         return {**ACC.public(), "logged_in": logged_in, "platform": PLATFORM}
@@ -433,26 +523,28 @@ def auth_api(path, body, logged_in):
         cur["check_updates"] = body.get("check_updates") is True   # только по явному согласию
         TL.configure(P.save_settings(cur))
         S.audit("account_created", f"user={user['username']} terms={A.TERMS_VERSION} age_verified=18+")
-        return new_session(user)
+        return new_session(user, lan)
     if path == "auth/login":
         user = ACC.login(body.get("username"), body.get("password"))
-        S.audit("login", f"user={user['username']}")
-        return new_session(user)
+        S.audit("login", f"user={user['username']}" + (" (телефон, домашняя сеть)" if lan else ""))
+        return new_session(user, lan)
     if path == "legal":
         return legal_doc(body.get("doc"))
     raise KeyError(path)
 
 
-def account_api(path, body):
+def account_api(path, body, tok=""):
     """Запросы, доступные только после входа."""
     global S, LOCK
     if path == "auth/logout":
-        S.audit("logout", f"user={SESSION['user']}")
-        SESSION["tok"] = SESSION["user"] = None
+        S.audit("logout", f"user={current_user()}")
+        SESSIONS.pop(tok, None)
         return {}
     if path == "auth/password":
         ACC.change_password(body.get("old"), body.get("new"), body.get("new2"))
-        S.audit("password_changed", f"user={SESSION['user']}")
+        S.audit("password_changed", f"user={current_user()}")
+        for t in [t for t in SESSIONS if t != tok]:
+            SESSIONS.pop(t, None)                       # смена пароля завершает остальные сеансы
         return {"message": "Пароль изменён"}
     if path == "auth/accept_terms":
         ACC.accept_terms()
@@ -475,7 +567,8 @@ def account_api(path, body):
         SEC.CT.cfg.update({"keywords": [], "allow": [], "background": False})
         SEC.CT.load()
         SEC.RW.cfg.update({"keywords": [], "seen": {}, "last": 0})
-        SESSION["tok"] = SESSION["user"] = None
+        SESSIONS.clear()
+        lan_stop()
         return {"deleted": True, "left": failed}
     raise KeyError(path)
 
@@ -719,6 +812,8 @@ def api(path, q, body):
         return labs_api(path, q, body)
     if path in ("ct", "ransom_watch"):
         return sec_api(path, body)
+    if path == "lan":
+        return lan_api(body)
     if path in ("anchors", "anchor", "anchor_check", "witness", "ach", "geopuzzle_features", "geopuzzle"):
         return unique_api(path, q, body)
     if path == "info":
@@ -832,10 +927,12 @@ class Handler(BaseHTTPRequestHandler):
     def token(self, q):
         return self.headers.get("X-Token") or (q.get("t") or [""])[0]
 
+    lan = False
+
     def authorized(self, q):
         """Только после входа: токен сеанса, выданный при входе/регистрации."""
-        tok, cur = self.token(q), SESSION["tok"]
-        return self.host_ok() and bool(cur) and secrets.compare_digest(tok, cur)
+        s = SESSIONS.get(self.token(q))
+        return self.host_ok() and bool(s) and s.get("lan", False) == self.lan
 
     def page_token_ok(self, q):
         return self.host_ok() and (secrets.compare_digest(self.token(q), TOKEN) or self.authorized(q))
@@ -858,8 +955,19 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/":
                 if not self.host_ok():
                     return self.out(403, "forbidden", "text/plain")
+                head = ""
+                if self.lan:
+                    k = urllib.parse.quote((q.get("k") or [""])[0])
+                    head = (f'<link rel="manifest" href="/manifest.webmanifest?k={k}"><meta name="apple-mobile-web-app-capable" content="yes">'
+                            '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+                            '<meta name="apple-mobile-web-app-title" content="Provenio"><meta name="theme-color" content="#030205">'
+                            '<link rel="apple-touch-icon" href="/icon.png">')
                 return self.out(200, PAGE.replace("__TOKEN__", TOKEN).replace("__VER__", P.APP_VERSION)
-                                .replace("__PLAT__", PLATFORM), "text/html; charset=utf-8")
+                                .replace("__PLAT__", "lan" if self.lan else PLATFORM).replace("<!--PWA-->", head),
+                                "text/html; charset=utf-8")
+            if u.path == "/icon.png":
+                with open(TL.res_path(os.path.join("assets", "provenio.png")), "rb") as f:
+                    return self.out(200, f.read(), "image/png", [("Cache-Control", "max-age=86400")])
             if u.path in ("/api/auth/status", "/api/auth/register", "/api/auth/login", "/api/legal"):
                 if not self.page_token_ok(q):
                     return self.out(403, {"error": "forbidden"})
@@ -867,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
                 if u.path == "/api/legal" and not body:
                     body = {"doc": (q.get("doc") or [""])[0]}
                 try:
-                    return self.out(200, auth_api(u.path[5:], body, self.authorized(q)))
+                    return self.out(200, auth_api(u.path[5:], body, self.authorized(q), lan=self.lan))
                 except (KeyError, ValueError) as e:
                     return self.out(400, {"error": str(e).strip("'")})
             if not self.authorized(q):
@@ -875,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
                                 {"error": "Войдите в аккаунт" if self.page_token_ok(q) else "forbidden"})
             if u.path.startswith("/api/auth/"):
                 try:
-                    return self.out(200, account_api(u.path[5:], self.read_body(method)))
+                    return self.out(200, account_api(u.path[5:], self.read_body(method), self.token(q)))
                 except (KeyError, ValueError) as e:
                     return self.out(400, {"error": str(e).strip("'")})
             if u.path == "/api/tool":   # совместимость с 1.x: синхронный вызов
@@ -923,6 +1031,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.handle_any("POST")
 
+
+class LanHandler(Handler):
+    """Тот же интерфейс для телефона в домашней сети: только локальные адреса, только с ключом из QR-кода."""
+    lan = True
+
+    def host_ok(self):
+        if not LAN["srv"] or not LANM.is_local_client(self.client_address[0]):
+            return False
+        return self.headers.get("Host", "") == f"{LAN['ip']}:{LAN['port']}"   # защита от DNS rebinding
+
+    def key_ok(self, q):
+        return secrets.compare_digest((q.get("k") or [""])[0], lan_cfg()["key"])
+
+    def handle_any(self, method):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        if not self.host_ok():
+            return self.out(403, "forbidden", "text/plain")
+        if u.path in ("/", "/manifest.webmanifest") and not self.key_ok(q):
+            return self.out(403, LAN_DENIED, "text/html; charset=utf-8")
+        if u.path == "/manifest.webmanifest":
+            k = (q.get("k") or [""])[0]
+            return self.out(200, json.dumps({"name": "Provenio", "short_name": "Provenio", "display": "standalone",
+                                             "start_url": f"/?k={k}", "background_color": "#030205", "theme_color": "#030205",
+                                             "icons": [{"src": "/icon.png", "sizes": "512x512", "type": "image/png"}]}),
+                            "application/manifest+json")
+        return super().handle_any(method)
+
+
+LAN_DENIED = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Provenio</title><body style="margin:0;background:#030205;color:#ece8f5;font:16px system-ui;display:grid;place-items:center;min-height:100vh;text-align:center;padding:24px">
+<div><div style="font-size:44px">📱</div><h2>Откройте по QR-коду</h2><p style="color:#9b93b5">В Provenio на компьютере нажмите «📱 Открыть на телефоне»<br>и отсканируйте QR-код камерой.</p></div></body>"""
 
 # ----------------------------------------------------------------- запуск
 def _message_box(text, title="Provenio", flags=0x40):
@@ -995,7 +1135,7 @@ def main():
 
 
 PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Provenio</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Provenio</title><!--PWA-->
 <style>
 :root{
  --bg:#060509; --bg2:#0a0713; --panel:rgba(20,14,34,.55);
@@ -1550,6 +1690,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
   <button class="ghost" id="inter">🔀 Пересечения кейсов</button>
   <button class="ghost" id="brandb">🛡 Мониторинг бренда</button>
   <button class="ghost" id="ddir">📁 Папка данных</button>
+  <button class="ghost" id="phoneb">📱 Открыть на телефоне</button>
   <button class="ghost" id="docsb">📄 Условия и конфиденциальность</button>
   <a class="ghost upd" id="updb" target="_blank" rel="noopener" hidden></a>
   <span class="ver">Provenio __VER__</span>
@@ -2673,7 +2814,7 @@ function bindAccount(b){b.querySelector("#sout").onclick=logout;b.querySelector(
 const LVC={1:"#34d399",2:"#22d3ee",3:"#a78bfa",4:"#fb923c",5:"#f43f5e"};
 let LAB=null,labLvl=0,labCur=null,labNav="";
 const dots=l=>`<span class="dots" style="--dc:${LVC[l]}">${[1,2,3,4,5].map(i=>`<i class="${i<=l?"on":""}"></i>`).join("")}</span>`;
-async function labsOpen(){try{LAB=await api("labs")}catch(x){$("#p-labs").innerHTML=`<div class="empty"><b>Лаборатория недоступна</b>${esc(x.message)}</div>`;return}
+async function labsOpen(){if(PLAT==="lan"){$("#p-labs").innerHTML='<div class="empty"><b>XSS-лаборатория — только на компьютере</b>Лабы работают на отдельном защищённом сервере, доступном лишь с этого компьютера.</div>';return}try{LAB=await api("labs")}catch(x){$("#p-labs").innerHTML=`<div class="empty"><b>Лаборатория недоступна</b>${esc(x.message)}</div>`;return}
  labCur?labOpen(labCur.id):labsGrid()}
 function labsGrid(){labCur=null;const L=LAB.labs,sol=LAB.progress.solved,n=Object.keys(sol).length,pc=Math.round(n/L.length*100);
  $("#p-labs").innerHTML=`<div class="lhero"><div class="lring" style="--p:${pc}"><b>${n}/${L.length}</b></div>
@@ -3008,6 +3149,29 @@ async function geoPuzzlePanel(){if(!GPF)try{GPF=await api("geopuzzle_features")}
     showMenu(ev.clientX,ev.clientY,[["Открыть",null],["🗺 OpenStreetMap",()=>window.open(x.osm,"_blank")],["🚶 Панорама Google",()=>window.open(x.gmaps,"_blank")],["🛰 Спутник Яндекса",()=>window.open(x.yandex,"_blank")]])};
    if(d.items.length){const c=d.items[0];GV.fly={lon:c.lon,lat:c.lat};GV.auto=false;$("#gauto").checked=false;GV.zoom=Math.max(GV.zoom,25)}}
   catch(x){$("#gp-msg").textContent="⚠ "+x.message}finally{b.classList.remove("loading")}}}
+
+/* =================== 2.6: ОТКРЫТЬ НА ТЕЛЕФОНЕ =================== */
+const LANMODE=PLAT==="lan";
+async function openPhone(){let s;try{s=await api("lan")}catch(x){return toast(x.message,"bad")}
+ const b=modal("📱 Provenio на телефоне",`<div class="row" style="gap:18px;align-items:flex-start;flex-wrap:wrap">
+  <div style="flex:1;min-width:260px"><div class="hint" style="font-size:12.5px;line-height:1.6">Телефон открывает этот же Provenio через вашу домашнюю сеть: кейсы, инструменты, глобус —
+   всё считается и хранится на компьютере, телефон — экран. Ничего ставить и подписывать не нужно.</div>
+   <ol class="pmsg" style="margin:10px 0 0 18px;line-height:1.7;font-size:12.5px"><li>Телефон и компьютер — в одной сети Wi-Fi.</li><li>Включите доступ и отсканируйте QR-код камерой.</li>
+   <li>Войдите своим паролем Provenio.</li><li>iPhone: «Поделиться» → «На экран „Домой“» — появится иконка, откроется как приложение.</li></ol>
+   <div class="row" style="gap:8px;margin-top:12px"><button class="btn" id="lanon">${s.on?"■ Выключить доступ":"▶ Включить доступ"}</button>
+    ${s.on?`<button class="ghost" id="lanrot" title="Старые QR-коды и иконки на телефонах перестанут работать">↻ Сменить ключ</button>`:""}</div>
+   <label class="cons" style="margin-top:10px"><input type="checkbox" id="lanauto" ${s.autostart?"checked":""}> <span>Включать при запуске Provenio (чтобы иконка на телефоне работала сразу)</span></label>
+   <div class="toolnote" style="margin-top:12px">🔒 Доступ только из локальной сети и только с ключом из QR-кода, затем — пароль аккаунта. Выключение сразу закрывает доступ и выходит из аккаунта на телефонах.
+   Соединение в домашней сети не шифруется — не включайте доступ в общественном Wi-Fi.
+   При первом включении Windows спросит разрешение для Provenio — разрешите <b>частные сети</b>. XSS-лаборатория работает только на компьютере.</div></div>
+  <div style="text-align:center">${s.on?`<div style="background:#fff;border-radius:18px;padding:10px;display:inline-block;box-shadow:0 0 40px rgba(139,92,246,.35)">${s.qr}</div>
+   <div class="pmsg" style="margin-top:8px;max-width:300px;word-break:break-all"><code>${esc(s.url)}</code></div>
+   <div class="pmsg">Телефонов в аккаунте: ${s.phones}</div>`:`<div class="empty" style="padding:30px 10px"><b>Доступ выключен</b>Включите, чтобы показать QR-код</div>`}</div></div>`);
+ b.onclick=async e=>{const t=e.target;
+  if(t.id==="lanon"){t.classList.add("loading");try{await api("lan",{action:s.on?"stop":"start"});openPhone()}catch(x){toast(x.message,"bad");t.classList.remove("loading")}}
+  if(t.id==="lanrot"){if(!confirm("Сменить ключ? Телефоны выйдут из аккаунта, понадобится отсканировать новый QR-код."))return;await api("lan",{action:"rotate"});openPhone()}};
+ b.querySelector("#lanauto").onchange=e=>api("lan",{action:"autostart",value:e.target.checked})}
+$("#phoneb").onclick=openPhone;if(LANMODE)$("#phoneb").hidden=true;
 $("#gchrono").onclick=chronoPanel;$("#gpuzzle").onclick=geoPuzzlePanel;$("#achb").onclick=openAch;$("#ancb").onclick=openAnchors;
 $("#inter").onclick=openIntersections;$("#brandb").onclick=openBrand;$("#pbb").onclick=openPlaybooks;$("#aib").onclick=openAi;
 setInterval(async()=>{if(!ME)return;try{const n=await api("notifications");if(n.length){n.forEach(x=>toast("🔔 "+x.text,"ok"));refresh()}}catch(x){}},20000);
