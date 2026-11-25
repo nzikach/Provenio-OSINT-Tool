@@ -58,11 +58,19 @@ jobs:
           echo "Project: $PROJ"
           xcodebuild -list -project "$PROJ" | tee ../schemes.log
           SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "import sys,json;print(json.load(sys.stdin)['project']['schemes'][0])")
+          set +e
           xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tee ../xcode.log | grep -E "error|warning: .*Python|BUILD" || true
-          test -d "$(find dd/Build/Products -maxdepth 2 -name '*.app' | head -1)"
+            build > ../xcode.log 2>&1
+          CODE=$?
+          set -e
+          grep -E "error:|\*\* BUILD" ../xcode.log | tail -40 || true
+          [ $CODE -eq 0 ] || { echo "xcodebuild завершился с кодом $CODE"; exit 1; }
+          APP=$(find dd/Build/Products -maxdepth 2 -name '*.app' | head -1)
+          # недоделанное приложение не упаковываем: без Info.plist iOS его не установит
+          test -f "$APP/Info.plist" || { echo "В $APP нет Info.plist"; ls -la "$APP" | head -40; exit 1; }
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|CFBundleExecutable"
 
       - name: Package IPA
         run: |
