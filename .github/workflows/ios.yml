@@ -4,10 +4,14 @@ name: Build Provenio for iPhone (IPA)
 # Sideloadly или TrollStore — они подписывают его вашим Apple ID).
 # Собирается на macOS: BeeWare Briefcase создаёт Xcode-проект, xcodebuild собирает
 # приложение для устройства без подписи, затем .app упаковывается в Payload/ -> .ipa.
+#
+# Mac-машин arm64 у GitHub часто не хватает (задание ждёт 15 минут и падает с «not acquired by Runner»),
+# поэтому собираем сразу на двух типах Mac: arm64 и Intel — в релиз попадёт тот, что соберётся.
+# Дособрать IPA в уже выпущенный релиз: git tag ipa-v2.4.0 && git push origin ipa-v2.4.0
 on:
   push:
-    branches: [main, ios-build]
-    tags: ["v*"]
+    branches: [main]
+    tags: ["v*", "ipa-v*"]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +19,11 @@ permissions:
 
 jobs:
   ipa:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,11 +81,22 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Provenio-ipa
+          name: Provenio-ipa-${{ matrix.os }}
           path: out/*
 
+      - name: Release tag
+        id: rel
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          T="${GITHUB_REF#refs/tags/}"; T="${T#ipa-}"
+          V=$(grep -oE 'APP_VERSION = "[^"]+"' provenio.py | cut -d'"' -f2)
+          [ "$T" = "v$V" ] || { echo "::error::Тег $T не совпадает с версией $V"; exit 1; }
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.rel.outputs.tag }}
           files: out/*
+          overwrite_files: true
