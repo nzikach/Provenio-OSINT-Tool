@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import uuid
 import webbrowser
@@ -1022,9 +1023,22 @@ class Handler(BaseHTTPRequestHandler):
                 with open(TL.res_path(os.path.join("assets", "world-110m.json")), "rb") as f:
                     return self.out(200, f.read(), "application/json")
             self.out(404, {"error": "not found"})
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            # нет интернета / сервис недоступен — коротко, без простыни в журнале
+            reason = getattr(e, "reason", e)
+            print(f"[{time.strftime('%H:%M:%S')}] сеть: {u.path} — {type(e).__name__}: {str(reason)[:120]}", flush=True)
+            try:
+                self.out(502, {"error": TL.redact(f"Нет связи с внешним сервисом: {str(reason)[:160]}")})
+            except OSError:
+                pass
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass        # клиент (вкладка, телефон) закрыл соединение
         except Exception as e:
             traceback.print_exc()
-            self.out(500, {"error": TL.redact(f"{type(e).__name__}: {e}")})
+            try:
+                self.out(500, {"error": TL.redact(f"{type(e).__name__}: {e}")})
+            except OSError:
+                pass
 
     def do_GET(self):
         self.handle_any("GET")
@@ -1718,7 +1732,7 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
 .logo b::after{display:none}
 .pill.ok::before,.pill.bad::before{animation:none}
 aside,.card,.pill,#p-graph,.toast,.menu,.ghud,.ginfo{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
-.modal-bg{backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.modal-bg{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;background:rgba(3,2,6,.78)}
 </style></head><body>
 <div class="bg"></div><div class="mesh"><i></i><i></i><i></i></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="grain"></div>
 <div id="auth"><div class="bg"></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="ahero">PROVENIO</div>
@@ -1949,7 +1963,7 @@ window.addEventListener("pointerup",e=>{const n=G.drag;G.drag=null;cv.style.curs
  if(n&&downAt&&Math.hypot(e.clientX-downAt[0],e.clientY-downAt[1])<5)pivotMenu(n,e.clientX,e.clientY);downAt=null});
 cv.onpointermove=e=>{const[x,y]=pt(e);if(G.drag){G.drag.x=x;G.drag.y=y;G.drag.vx=G.drag.vy=0}G.hover=nearest(x,y)};
 cv.onpointerleave=()=>G.hover=null;
-let GRAF=0;function tick(){if(tab!=="graph"||!W||document.hidden){GRAF=0;return}GRAF=requestAnimationFrame(tick);const N=G.nodes;
+let GRAF=0;function tick(){if(tab!=="graph"||!W||document.hidden||modalOpen()){GRAF=0;return}GRAF=requestAnimationFrame(tick);const N=G.nodes;
  for(let i=0;i<N.length;i++){const a=N[i];a.age=Math.min(1,a.age+.04);
   for(let j=i+1;j<N.length;j++){const b=N[j];let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.5,m=Math.sqrt(d2),f=2800/d2;dx/=m;dy/=m;a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f}
   a.vx+=(W/2-a.x)*.0016;a.vy+=(H/2-a.y)*.0016}
@@ -2002,7 +2016,8 @@ function showMenu(x,y,items){closeMenu();const m=document.createElement("div");m
 function modal(title,html){closeModal();const bg=document.createElement("div");bg.className="modal-bg";
  bg.innerHTML=`<div class="modal"><h3>${title}<button class="x" title="Закрыть">✕</button></h3><div class="mb">${html}</div></div>`;
  bg.onclick=e=>{if(e.target===bg||e.target.classList.contains("x"))closeModal()};document.body.append(bg);return bg.querySelector(".mb")}
-function closeModal(){$$(".modal-bg").forEach(m=>m.remove())}
+function closeModal(){$$(".modal-bg").forEach(m=>m.remove());loops()}
+const modalOpen=()=>!!document.querySelector(".modal-bg");
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeModal();closeMenu()}});
 
 /* =================== ХРОНОЛОГИЯ =================== */
@@ -2728,7 +2743,7 @@ function gPos(l,o,now){if(l==="sats")return satPos(o,now);if(l==="flights"){cons
 function gPath(ring,clamp){let first=true;for(const[lon,lat]of ring){const p=proj(lon,lat);let x=p.x,y=p.y;
  if(p.z<0){if(!clamp){first=true;continue}const n=Math.hypot(p.ux,p.uy)||1,R=gR();x=GW/2+p.ux/n*R;y=GH/2-p.uy/n*R}
  if(first){gx.moveTo(x,y);first=false}else gx.lineTo(x,y)}}
-function gTick(t){if(tab!=="globe"||!GW||document.hidden){GV.raf=0;return}GV.raf=requestAnimationFrame(gTick);const dt=Math.min(100,t-GV.last);GV.last=t;const now=Date.now();
+function gTick(t){if(tab!=="globe"||!GW||document.hidden||modalOpen()){GV.raf=0;return}GV.raf=requestAnimationFrame(gTick);if(t-(GV.drawn||0)<(document.hasFocus()?32:120))return;GV.drawn=t;const dt=Math.min(100,t-GV.last);GV.last=t;const now=Date.now();
  if(GV.auto&&!gDown&&!GV.sel)GV.lon+=dt*.004;
  if(GV.fly){GV.lon+=(((GV.fly.lon-GV.lon+540)%360)-180)*.08;GV.lat+=(GV.fly.lat-GV.lat)*.08;if(Math.abs(GV.fly.lat-GV.lat)<.05)GV.fly=null}
  if(GV.track&&GV.sel){const p=gPos(GV.sel.l,GV.sel.o,now);if(p){GV.lon+=(((p.lon-GV.lon+540)%360)-180)*.1;GV.lat+=(p.lat-GV.lat)*.1}}
