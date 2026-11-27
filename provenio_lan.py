@@ -11,6 +11,7 @@ QR-код генерируется локально (свой кодировщи
 """
 import ipaddress
 import socket
+from http.server import ThreadingHTTPServer
 
 # ======================================================================= QR-код
 _EXP, _LOG = [0] * 512, [0] * 256
@@ -222,3 +223,16 @@ def is_local_client(ip):
     if getattr(a, "ipv4_mapped", None):
         a = a.ipv4_mapped
     return a.is_private or a.is_link_local or a.is_loopback
+
+
+class ExclusiveServer(ThreadingHTTPServer):
+    """HTTP-сервер, порт которого не может занять другая программа.
+    По умолчанию Python включает SO_REUSEADDR, а в Windows это позволяет второму процессу
+    привязаться к тому же порту и перехватывать запросы."""
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()

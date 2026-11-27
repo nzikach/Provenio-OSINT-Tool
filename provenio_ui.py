@@ -348,9 +348,9 @@ def lan_start():
     if ip.startswith("127."):
         raise ValueError("Компьютер не подключён к локальной сети (Wi-Fi или кабель)")
     try:
-        srv = ThreadingHTTPServer((ip, int(d["port"])), LanHandler)
+        srv = LANM.ExclusiveServer((ip, int(d["port"])), LanHandler)
     except OSError:
-        srv = ThreadingHTTPServer((ip, 0), LanHandler)        # порт занят — берём любой и запоминаем
+        srv = LANM.ExclusiveServer((ip, 0), LanHandler)        # порт занят — берём любой и запоминаем
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     LAN.update(srv=srv, ip=ip, port=srv.server_address[1])
@@ -1103,7 +1103,7 @@ def main():
     if not _single_instance():
         _message_box("Provenio уже запущен — переключитесь на открытое окно.")
         return
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv = LANM.ExclusiveServer(("127.0.0.1", 0), Handler)
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
@@ -1673,6 +1673,16 @@ label.f{display:flex;flex-direction:column;gap:6px;margin:6px 0;font-size:12px;c
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(168,130,255,.2);border-radius:9px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(168,130,255,.35)}
+/* ---------- 2.6.1: производительность ----------
+   Фон рисуется один раз: бесконечные анимации огромных размытых пятен и «стекло» поверх движущегося фона
+   заставляли видеокарту перерисовывать весь экран 60 раз в секунду (≈150% ядра процессора в простое). */
+.mesh i,.liquid i{animation:none!important}
+.mesh i{mix-blend-mode:normal;filter:blur(90px)}
+.liquid{mix-blend-mode:normal}
+.logo b::after{display:none}
+.pill.ok::before,.pill.bad::before{animation:none}
+aside,.card,.pill,#p-graph,.toast,.menu,.ghud,.ginfo{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.modal-bg{backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 </style></head><body>
 <div class="bg"></div><div class="mesh"><i></i><i></i><i></i></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="grain"></div>
 <div id="auth"><div class="bg"></div><div class="liquid a"><i></i></div><div class="liquid b"><i></i></div><div class="ahero">PROVENIO</div>
@@ -1808,8 +1818,11 @@ function num(el,to){const f=+el.dataset.v||0;el.dataset.v=to;const t0=performanc
  (function s(t){const p=Math.min(1,(t-t0)/850),e=1-Math.pow(1-p,3);el.textContent=Math.round(f+(to-f)*e);if(p<1)requestAnimationFrame(s)})(t0)}
 function moveInk(){const b=$(".tab.on"),k=$("#ink");if(!b)return;k.style.width=b.offsetWidth+"px";k.style.transform="translateX("+(b.offsetLeft-28)+"px)"}
 function setTab(t){tab=t;$$(".tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
- $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(sizeCv,30);if(t==="time")renderTimeline();
- if(t==="globe")setTimeout(globeOpen,30);if(t==="labs")labsOpen();if(t==="ct")ctOpen()}
+ $$(".panel").forEach(p=>p.classList.toggle("on",p.id==="p-"+t));moveInk();if(t==="graph")setTimeout(()=>{sizeCv();loops()},30);if(t==="time")renderTimeline();
+ if(t==="globe")setTimeout(()=>{globeOpen();loops()},30);if(t==="labs")labsOpen();if(t==="ct")ctOpen();loops()}
+// циклы отрисовки графа и глобуса работают только на своей вкладке и в видимом окне
+function loops(){if(tab==="graph"&&!GRAF)GRAF=requestAnimationFrame(tick);if(tab==="globe"&&GW&&!GV.raf){GV.last=performance.now();GV.raf=requestAnimationFrame(gTick)}}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)loops()});
 $$(".tab").forEach(b=>b.onclick=()=>setTab(b.dataset.t));
 
 function renderCases(){$("#cases").innerHTML=cases.map((c,i)=>`<div class="case ${cur&&cur.id===c.id?"on":""}" data-id="${c.id}" style="animation-delay:${i*40}ms">${esc(c.name)}</div>`).join("")||'<div class="mu" style="padding:8px;color:var(--mu2)">Создайте первый кейс ↓</div>'}
@@ -1900,7 +1913,7 @@ window.addEventListener("pointerup",e=>{const n=G.drag;G.drag=null;cv.style.curs
  if(n&&downAt&&Math.hypot(e.clientX-downAt[0],e.clientY-downAt[1])<5)pivotMenu(n,e.clientX,e.clientY);downAt=null});
 cv.onpointermove=e=>{const[x,y]=pt(e);if(G.drag){G.drag.x=x;G.drag.y=y;G.drag.vx=G.drag.vy=0}G.hover=nearest(x,y)};
 cv.onpointerleave=()=>G.hover=null;
-function tick(){requestAnimationFrame(tick);if(tab!=="graph"||!W)return;const N=G.nodes;
+let GRAF=0;function tick(){if(tab!=="graph"||!W||document.hidden){GRAF=0;return}GRAF=requestAnimationFrame(tick);const N=G.nodes;
  for(let i=0;i<N.length;i++){const a=N[i];a.age=Math.min(1,a.age+.04);
   for(let j=i+1;j<N.length;j++){const b=N[j];let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.5,m=Math.sqrt(d2),f=2800/d2;dx/=m;dy/=m;a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f}
   a.vx+=(W/2-a.x)*.0016;a.vy+=(H/2-a.y)*.0016}
@@ -1914,7 +1927,6 @@ function tick(){requestAnimationFrame(tick);if(tab!=="graph"||!W)return;const N=
   if(n.t==="src")cx.roundRect?cx.roundRect(n.x-r,n.y-r,r*2,r*2,3):cx.rect(n.x-r,n.y-r,r*2,r*2);else cx.arc(n.x,n.y,r,0,7);cx.fill();cx.shadowBlur=0;
   if(n.t==="src"||near.has(n)){cx.fillStyle="#ece8f5";cx.font="11px Segoe UI,sans-serif";cx.textAlign="center";cx.fillText(n.l.slice(0,34),n.x,n.y+r+14)}}
  cx.globalAlpha=1}
-requestAnimationFrame(tick);
 
 /* =================== ПИВОТЫ (Maltego-подобно) =================== */
 const PIVOTS={
@@ -2635,7 +2647,7 @@ async function globeOpen(){gSize();if(GV.inited)return;GV.inited=true;
  try{const r=await fetch("/static/world.json",{headers:{"X-Token":T}});const w=topo(await r.json());GV.land=w.land;GV.borders=w.brd;buildMask()}catch(x){$("#gstat").textContent="Карта не загрузилась"}
  api("globe?layer=groups").then(g=>{$("#ggroup").innerHTML=Object.entries(g).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("")});
  for(const l of Object.keys(GV.L))if(GV.L[l].on)gLoad(l);
- setInterval(()=>{if(tab==="globe"&&GV.L.flights.on)gLoad("flights")},30000);requestAnimationFrame(gTick)}
+ setInterval(()=>{if(tab==="globe"&&GV.L.flights.on)gLoad("flights")},30000);loops()}
 $$("#p-globe [data-l]").forEach(c=>c.onchange=()=>{const L=GV.L[c.dataset.l];L.on=c.checked;if(L.on&&!L.items.length)gLoad(c.dataset.l)});
 $("#ggroup").onchange=e=>{GV.L.sats.group=e.target.value;GV.L.sats.items=[];gLoad("sats")};
 $("#gauto").onchange=e=>GV.auto=e.target.checked;
@@ -2680,7 +2692,7 @@ function gPos(l,o,now){if(l==="sats")return satPos(o,now);if(l==="flights"){cons
 function gPath(ring,clamp){let first=true;for(const[lon,lat]of ring){const p=proj(lon,lat);let x=p.x,y=p.y;
  if(p.z<0){if(!clamp){first=true;continue}const n=Math.hypot(p.ux,p.uy)||1,R=gR();x=GW/2+p.ux/n*R;y=GH/2-p.uy/n*R}
  if(first){gx.moveTo(x,y);first=false}else gx.lineTo(x,y)}}
-function gTick(t){requestAnimationFrame(gTick);if(tab!=="globe"||!GW)return;const dt=Math.min(100,t-GV.last);GV.last=t;const now=Date.now();
+function gTick(t){if(tab!=="globe"||!GW||document.hidden){GV.raf=0;return}GV.raf=requestAnimationFrame(gTick);const dt=Math.min(100,t-GV.last);GV.last=t;const now=Date.now();
  if(GV.auto&&!gDown&&!GV.sel)GV.lon+=dt*.004;
  if(GV.fly){GV.lon+=(((GV.fly.lon-GV.lon+540)%360)-180)*.08;GV.lat+=(GV.fly.lat-GV.lat)*.08;if(Math.abs(GV.fly.lat-GV.lat)<.05)GV.fly=null}
  if(GV.track&&GV.sel){const p=gPos(GV.sel.l,GV.sel.o,now);if(p){GV.lon+=(((p.lon-GV.lon+540)%360)-180)*.1;GV.lat+=(p.lat-GV.lat)*.1}}

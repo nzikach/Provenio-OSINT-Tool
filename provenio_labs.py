@@ -468,8 +468,8 @@ def ensure_server():
     with LOCK:
         if SERVER["port"]:
             return SERVER["port"]
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), LabHandler)
-        srv.daemon_threads = True
+        import provenio_lan
+        srv = provenio_lan.ExclusiveServer(("127.0.0.1", 0), LabHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         SERVER["port"] = srv.server_address[1]
         SERVER["srv"] = srv
