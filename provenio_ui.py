@@ -357,6 +357,7 @@ def lan_start():
     d["port"] = LAN["port"]
     lan_save(d)
     S.audit("lan_on", f"http://{ip}:{LAN['port']}/")
+    print(f"[{time.strftime('%H:%M:%S')}] доступ с телефона включён: {ip}:{LAN['port']}", flush=True)
 
 
 def lan_stop():
@@ -1096,6 +1097,40 @@ def _setup_logging():
     log = open(os.path.join(P.DATA_DIR, "provenio.log"), "a", encoding="utf-8", buffering=1)
     log.write(f"\n=== Provenio {P.APP_VERSION} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     sys.stdout = sys.stderr = log
+    import faulthandler
+    faulthandler.enable(file=log, all_threads=True)       # падения интерпретатора — со стеком всех потоков
+
+    def thread_hook(a):
+        log.write(f"[{time.strftime('%H:%M:%S')}] ошибка в потоке {a.thread.name if a.thread else '?'}:\n")
+        traceback.print_exception(a.exc_type, a.exc_value, a.exc_traceback, file=log)
+    threading.excepthook = thread_hook
+
+
+WINDOW_TITLE = f"Provenio {P.APP_VERSION} — OSINT с доказательной базой"
+
+
+def _hang_watchdog():
+    """Windows: если окно не отвечает дольше 6 с — пишем в журнал, чем заняты все потоки Python."""
+    if os.name != "nt" or not P.FROZEN:
+        return
+    import ctypes
+    import faulthandler
+    user32 = ctypes.windll.user32
+    since, reported = None, 0.0
+    while True:
+        time.sleep(2)
+        try:
+            hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+            if not hwnd or not user32.IsHungAppWindow(hwnd):
+                since = None
+                continue
+            since = since or time.time()
+            if time.time() - since > 6 and time.time() - reported > 120:
+                reported = time.time()
+                print(f"[{time.strftime('%H:%M:%S')}] ОКНО НЕ ОТВЕЧАЕТ {int(time.time() - since)} с — стеки потоков:", flush=True)
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
 
 
 def main():
@@ -1111,7 +1146,8 @@ def main():
         import webview
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
-        webview.create_window(f"Provenio {P.APP_VERSION} — OSINT с доказательной базой", url,
+        threading.Thread(target=_hang_watchdog, daemon=True, name="hang-watchdog").start()
+        webview.create_window(WINDOW_TITLE, url,
                               width=1400, height=900, min_size=(1100, 680), background_color="#060509",
                               text_select=True)
         storage = os.path.join(P.DATA_DIR, "webview")
