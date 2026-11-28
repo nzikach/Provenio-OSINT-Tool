@@ -51,8 +51,7 @@ JOBS = {}
 BLOBS = {}
 UPDATE = {"ts": 0, "data": None}
 MAX_BODY = 45 * 1024 * 1024   # загрузка файлов для анализа метаданных / проверки пакета
-PLATFORM = os.environ.get("PROVENIO_PLATFORM", "desktop")   # "ios" — приложение для iPhone
-EXPORT_DIR = os.environ.get("PROVENIO_EXPORT_DIR", "")       # куда сохранять экспорт на iPhone («Файлы»)
+PLATFORM = "desktop"
 
 
 def capture_fn():
@@ -762,20 +761,6 @@ def api(path, q, body):
         return {"id": bid}
     if path == "portable":
         return make_portable()
-    if path == "open_url":
-        url = str(body.get("url", ""))
-        if not url.lower().startswith(("http://", "https://")):
-            raise ValueError("Открываются только веб-ссылки")
-        webbrowser.open(url)
-        return {}
-    if path == "export_save":
-        data, ctype, fname = download(str(body.get("kind")), str(body.get("case")))
-        folder = EXPORT_DIR or os.path.join(P.DATA_DIR, "exports")
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, fname), "wb") as f:
-            f.write(data)
-        S.audit("export_saved", fname)
-        return {"name": fname, "folder": folder}
     if path == "rel":
         S.update_source(int(body["id"]), reliability=max(1, min(5, int(body["reliability"]))))
         return {}
@@ -1869,7 +1854,7 @@ label.f input{height:36px}
 </nav>
 <div id="toasts" role="status" aria-live="polite"></div>
 <script>
-const PLAT="__PLAT__",IOS=PLAT==="ios",PAGE_T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const PLAT="__PLAT__",PAGE_T="__TOKEN__",$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const TY={email:"#e8a07a",phone:"#7bd88f",domain:"#8fb8f0",ip:"#f0c674",account:"#f08a8a",src:"#f2f2f2"};
 const IC={file:'<path d="M14 3H6.5A1.5 1.5 0 0 0 5 4.5v15A1.5 1.5 0 0 0 6.5 21h11a1.5 1.5 0 0 0 1.5-1.5V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>',
@@ -2525,15 +2510,7 @@ async function addUrls(){const list=$("#url").value.split(/[\s,]+/).filter(Boole
 $("#add").onclick=addUrls;$("#url").onkeydown=e=>{if(e.key==="Enter")addUrls()};
 $("#ver").onclick=async()=>{if(!cur)return;await refresh();const i=st.integrity;
  toast("Снимки: "+i.snap_ok+" целы, "+i.snap_bad+" нарушены. Журнал: "+(i.chain?"цел":"НАРУШЕН"),i.snap_bad||!i.chain?"bad":"ok")};
-function viewer(u,title){modal(esc(title||"Просмотр"),`<iframe src="${esc(u)}" style="width:100%;height:72vh;border:0;border-radius:12px;background:#fff"></iframe>`)}
-function saveIOS(kind,id){return api("export_save",{kind,case:id}).then(r=>toast("Сохранено: «Файлы» → На iPhone → Provenio → "+r.name,"ok")).catch(x=>toast(x.message,"bad"))}
-if(IOS){
- document.addEventListener("click",e=>{const a=e.target.closest("a[target=_blank]");if(!a)return;e.preventDefault();e.stopPropagation();
-  const h=a.getAttribute("href")||"";if(/^https?:/i.test(h))api("open_url",{url:h}).catch(x=>toast(x.message,"bad"));else viewer(h)},true);
- window.open=u=>{if(/^https?:/i.test(u))api("open_url",{url:u});else viewer(u);return null};
-}
-function dl(kind){if(!cur)return;
- if(IOS){if(kind==="report")viewer(`/download/report?case=${cur.id}&t=${T}`,"Отчёт");else saveIOS(kind,cur.id);setTimeout(refresh,800);return}const a=document.createElement("a");a.href=`/download/${kind}?case=${cur.id}&t=${T}`;
+function dl(kind){if(!cur)return;const a=document.createElement("a");a.href=`/download/${kind}?case=${cur.id}&t=${T}`;
  if(kind==="report")a.target="_blank";else a.download="";document.body.append(a);a.click();a.remove();setTimeout(refresh,800)}
 $("#rep").onclick=e=>{e.stopPropagation();if(!cur)return toast("Сначала выберите кейс","bad");const r=e.currentTarget.getBoundingClientRect();
  showMenu(Math.max(8,r.right-300),r.bottom+6,[["Экспорт кейса",null],["Отчёт HTML (откроется в браузере)",()=>dl("report")],["Пакет доказательств ZIP",()=>dl("evidence")],["Проверяемый отчёт HTML (сам себя проверяет)",()=>dl("verify")],["Якоря в блокчейне…",openAnchors],
@@ -2556,14 +2533,14 @@ async function openSettings(){const s=await api("settings"),i=await api("info");
   <div class="sec" style="margin-top:14px"><b>Архивация страниц</b>
    ${chk("scap",s.capture_screenshot,"Сохранять скриншот страницы (PNG) как доказательство")}
    ${chk("spdf",s.capture_pdf,"Сохранять страницу в PDF")}
-   <div class="hint">${IOS?"На iPhone скриншоты и PDF страниц пока недоступны — сохраняются HTML-снимок и SHA-256.":i.browser?"Браузер для снимков: "+esc(i.browser):"Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
+   <div class="hint">${i.browser?"Браузер для снимков: "+esc(i.browser):"Не найден Microsoft Edge или Chrome — скриншоты недоступны"}</div></div>
   <div class="sec"><b>Метка времени RFC 3161 для пакета доказательств</b>
    ${chk("stsa",s.tsa_enabled,"Заверять manifest.json у независимой службы времени (TSA)")}
    ${chk("sots",s.ots_enabled!==false,"Закреплять пакет в блокчейне Bitcoin (OpenTimestamps, бесплатно)")}
    <div class="frow"><label>Служба TSA</label><input id="stsau" placeholder="http://timestamp.digicert.com (по умолчанию)" value="${esc(s.tsa_url||"")}"></div></div>
   <div class="sec"><b>Прочее</b>${chk("supd",s.check_updates,"Проверять обновления на GitHub при запуске")}</div>
   <div class="sec"><b>Портативный режим</b><div class="hint">${i.portable?"✓ Включён: данные хранятся в папке ProvenioData рядом с программой.":"Данные в профиле пользователя: "+esc(i.data_dir)}</div>
-   ${i.portable||IOS?"":`<button class="ghost" id="sport" style="margin-top:6px">Перенести данные к программе (флешка)</button>`}</div>
+   ${i.portable?"":`<button class="ghost" id="sport" style="margin-top:6px">Перенести данные к программе (флешка)</button>`}</div>
   ${accountSection()}
   <div class="row" style="margin-top:14px"><button class="btn" id="ssave">Сохранить</button><span class="pmsg">Provenio ${esc(i.version)} · инструментов: ${i.tools} · сайтов для поиска по нику: ${i.sites}<br>Данные: ${esc(i.data_dir)}</span></div>`);
  b.querySelector("#ssave").onclick=async()=>{const keys={};b.querySelectorAll(".skey").forEach(x=>keys[x.dataset.k]=x.value);
@@ -2678,7 +2655,6 @@ async function exportPng(){if(tab!=="graph"){setTab("graph");await new Promise(r
  x.fillStyle="#0a0a0a";x.fillRect(0,0,c.width,c.height);x.drawImage(cv,0,0);
  x.fillStyle="#a3a3a3";x.font=(12*dpr)+"px Segoe UI";x.fillText(`Provenio · ${cur?cur.name:""} · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC`,14*dpr,22*dpr);
  const r=await api("blob",{data:c.toDataURL("image/png"),ctype:"image/png",name:`provenio_graph_${(cur&&cur.name||"case").replace(/[^\w-]+/g,"_")}.png`});
- if(IOS)return saveIOS("blob",r.id);
  const a=document.createElement("a");a.href=`/download/blob?id=${r.id}&t=${T}`;a.download="";document.body.append(a);a.click();a.remove()}
 
 /* =================== IP-РАДАР =================== */
@@ -3338,7 +3314,7 @@ async function openPhone(){let s;try{s=await api("lan")}catch(x){return toast(x.
   <div style="flex:1;min-width:260px"><div class="hint" style="font-size:12.5px;line-height:1.6">Телефон открывает этот же Provenio через вашу домашнюю сеть: кейсы, инструменты, глобус —
    всё считается и хранится на компьютере, телефон — экран. Ничего ставить и подписывать не нужно.</div>
    <ol class="pmsg" style="margin:10px 0 0 18px;line-height:1.7;font-size:12.5px"><li>Телефон и компьютер — в одной сети Wi-Fi.</li><li>Включите доступ и отсканируйте QR-код камерой.</li>
-   <li>Войдите своим паролем Provenio.</li><li>iPhone: «Поделиться» → «На экран „Домой“» — появится иконка, откроется как приложение.</li></ol>
+   <li>Войдите своим паролем Provenio.</li><li>На телефоне: «Поделиться» → «На экран „Домой“» — появится иконка, откроется как приложение.</li></ol>
    <div class="row" style="gap:8px;margin-top:12px"><button class="btn" id="lanon">${s.on?"Выключить доступ":"Включить доступ"}</button>
     ${s.on?`<button class="ghost" id="lanrot" title="Старые QR-коды и иконки на телефонах перестанут работать">Сменить ключ</button>`:""}</div>
    <label class="cons" style="margin-top:10px"><input type="checkbox" id="lanauto" ${s.autostart?"checked":""}> <span>Включать при запуске Provenio (чтобы иконка на телефоне работала сразу)</span></label>

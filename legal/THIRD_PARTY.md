@@ -15,8 +15,6 @@
 | pydantic, pydantic_core, jiter, annotated-types, typing-inspection, typing_extensions, docstring_parser, distro | — | MIT/PSF | разбор ответов anthropic | нет |
 | opentelemetry-api | 1.45 | Apache-2.0 | интерфейс трассировки в anthropic. Экспортёр не подключён, поэтому **телеметрия не отправляется** | нет |
 | PyInstaller (загрузчик) | 6.22 | GPL-2 с исключением | упаковка в exe, загрузчик собирается из исходников | нет |
-| certifi | — | MPL-2.0 | корневые сертификаты (iPhone) | нет |
-| Toga, Briefcase | 0.5 / 0.4 | BSD-3 | приложение для iPhone | нет |
 
 **Чего в программе нет:** SDK аналитики (Google Analytics, Firebase, Sentry, Mixpanel), рекламных сетей, сборщиков отчётов о сбоях и фоновых «пингов».
 

@@ -107,11 +107,10 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(P.parse_date("не дата"))
 
     def test_versions_match(self):
-        """Версия в exe (свойства файла), приложении для iPhone и в коде — одна."""
+        """Версия в exe (свойства файла) и в коде — одна."""
         vi = open(os.path.join(ROOT, "assets", "version_info.txt"), encoding="utf-8").read()
         self.assertIn(f"'{P.APP_VERSION}'", vi)
         self.assertIn("(" + ", ".join(P.APP_VERSION.split(".")) + ", 0)", vi)
-        self.assertIn(f'version = "{P.APP_VERSION}"', open(os.path.join(ROOT, "ios", "pyproject.toml"), encoding="utf-8").read())
 
     def test_settings_roundtrip(self):
         P.save_settings({"proxy": "http://127.0.0.1:8080", "keys": {"shodan": "secret123"}})
