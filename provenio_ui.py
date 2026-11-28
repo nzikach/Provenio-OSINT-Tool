@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Provenio UI — современный интерфейс (чёрно-фиолетовое стекло, Apple-motion).
+Provenio UI — монохромный интерфейс 3.0.
 Запуск: python provenio_ui.py   (provenio.py, provenio_tools.py, provenio_osint.py рядом)
 Готовая сборка: Provenio.exe (см. build.ps1).
 
