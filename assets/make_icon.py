@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""Генерирует assets/provenio.ico (фиолетовый градиент + ромб ◈) без сторонних библиотек.
+"""Генерирует assets/provenio.ico и provenio.png: белый скруглённый квадрат с чёрной буквой P, без сторонних библиотек.
 Запуск: python assets/make_icon.py"""
 import math
 import os
 import struct
 import zlib
+
+
+def mark(u, v):
+    """Буква P знака Provenio в координатах 0..1: ствол и чаша."""
+    if 0.31 <= u <= 0.43 and 0.22 <= v <= 0.78:
+        return True
+    outer = (0.31 <= u <= 0.52 and 0.22 <= v <= 0.60) or (u >= 0.52 and (u - 0.52) ** 2 + (v - 0.41) ** 2 <= 0.19 ** 2)
+    hole = (0.43 <= u <= 0.52 and 0.33 <= v <= 0.49) or (u >= 0.52 and (u - 0.52) ** 2 + (v - 0.41) ** 2 <= 0.08 ** 2)
+    return outer and not hole
+
+
+def ink(x, y, size):
+    """Доля пикселя, покрытая буквой (сглаживание по 4 или 16 точкам)."""
+    n = 2 if size > 256 else 4
+    hit = sum(mark((x + (i + .5) / n) / size, (y + (j + .5) / n) / size) for i in range(n) for j in range(n))
+    return hit / (n * n)
 
 
 def png(size):
@@ -18,18 +34,9 @@ def png(size):
             cy = min(max(y + .5, r_corner), size - r_corner)
             d = math.hypot(x + .5 - cx, y + .5 - cy)
             a = max(0.0, min(1.0, r_corner - d + .5))
-            t = (x + y) / (2 * size)                   # диагональный градиент #8b5cf6 -> #e879f9
-            r = int(0x8b + (0xe8 - 0x8b) * t)
-            g = int(0x5c + (0x79 - 0x5c) * t)
-            b = int(0xf6 + (0xf9 - 0xf6) * t)
-            # ромб: внешний контур и внутренний ромб (◈)
-            u, v = abs(x + .5 - size / 2), abs(y + .5 - size / 2)
-            m = (u + v) / (size / 2)
-            ring = 0.52 < m < 0.66
-            core = m < 0.30
-            if ring or core:
-                r, g, b = 255, 255, 255
-            row += bytes([r, g, b, int(255 * a)])
+            k = ink(x, y, size)                          # белый #f2f2f2 -> чёрный #0a0a0a
+            c = int(0xf2 + (0x0a - 0xf2) * k)
+            row += bytes([c, c, c, int(255 * a)])
         rows.append(bytes(row))
     raw = b"".join(rows)
 

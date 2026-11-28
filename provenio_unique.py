@@ -275,13 +275,13 @@ def witness(url, our_text=""):
 # ======================================================================= 1c. самопроверяющийся отчёт
 VERIFY_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Provenio — проверяемый отчёт: __TITLE__</title><style>
-body{margin:0;font:14px/1.55 "Segoe UI",system-ui,sans-serif;background:#05040a;color:#ece8f5}main{max-width:1000px;margin:0 auto;padding:28px 18px}
-h1{font-size:26px;margin:0 0 4px}h2{font-size:17px;margin:26px 0 10px;color:#c4a1ff}.mu{color:#9b93b5}
-.card{background:linear-gradient(160deg,rgba(255,255,255,.07),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.1);border-radius:18px;padding:16px 18px;margin:12px 0}
-.big{display:flex;gap:14px;align-items:center;font-size:18px;font-weight:700}.dot{width:16px;height:16px;border-radius:50%;background:#6f6690}
-.ok .dot{background:#34d399;box-shadow:0 0 14px #34d399}.bad .dot{background:#fb7185;box-shadow:0 0 14px #fb7185}
-table{width:100%;border-collapse:collapse;font-size:12.5px}td,th{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left;vertical-align:top}
-th{color:#c4a1ff}code{font:11.5px Consolas,monospace;word-break:break-all}.y{color:#34d399}.n{color:#fb7185}a{color:#c4a1ff}
+body{margin:0;font:14px/1.55 "Segoe UI",system-ui,sans-serif;background:#0a0a0a;color:#f2f2f2}main{max-width:1000px;margin:0 auto;padding:28px 18px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:16px;margin:26px 0 10px;color:#f2f2f2}.mu{color:#a3a3a3}
+.card{background:#121212;border:1px solid #242424;border-radius:8px;padding:16px 18px;margin:12px 0}
+.big{display:flex;gap:12px;align-items:center;font-size:17px;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#7e7e7e}
+.ok .dot{background:#7bd88f}.bad .dot{background:#ff6b6b}
+table{width:100%;border-collapse:collapse;font-size:12.5px}td,th{padding:6px 8px;border-bottom:1px solid #242424;text-align:left;vertical-align:top}
+th{color:#a3a3a3;font-weight:600}code{font:11.5px Consolas,monospace;word-break:break-all}.y{color:#7bd88f}.n{color:#ff6b6b}a{color:#f2f2f2}
 </style></head><body><main>
 <h1>__TITLE__</h1><div class="mu">Отчёт Provenio __VER__ · создан __CREATED__ · этот файл проверяет себя сам: ничего не нужно устанавливать.</div>
 <div class="card big" id="sum"><span class="dot"></span><span id="sumt">Проверяю…</span></div>
@@ -511,45 +511,45 @@ def attribution(q, job=None):
 
 # ======================================================================= 3. геопазл (Overpass)
 FEATURES = {
-    "church": ("⛪ Церковь", 'nwr["amenity"="place_of_worship"]["religion"="christian"]'),
-    "mosque": ("🕌 Мечеть", 'nwr["amenity"="place_of_worship"]["religion"="muslim"]'),
-    "temple": ("🛕 Храм (любой)", 'nwr["amenity"="place_of_worship"]'),
-    "river": ("🌊 Река", 'way["waterway"="river"]'),
-    "canal": ("〰 Канал", 'way["waterway"="canal"]'),
-    "lake": ("💧 Озеро/пруд", 'nwr["natural"="water"]'),
-    "beach": ("🏖 Пляж", 'nwr["natural"="beach"]'),
-    "railway": ("🛤 Железная дорога", 'way["railway"="rail"]'),
-    "station": ("🚉 Ж/д станция", 'nwr["railway"~"^(station|halt)$"]'),
-    "tram": ("🚋 Трамвайные пути", 'way["railway"="tram"]'),
-    "bridge": ("🌉 Мост", 'way["bridge"="yes"]["highway"]'),
-    "motorway": ("🛣 Автомагистраль", 'way["highway"~"^(motorway|trunk)$"]'),
-    "roundabout": ("⭕ Круговое движение", 'way["junction"="roundabout"]'),
-    "fuel": ("⛽ Заправка", 'nwr["amenity"="fuel"]'),
-    "power_line": ("⚡ ЛЭП", 'way["power"="line"]'),
-    "substation": ("🔌 Подстанция", 'nwr["power"="substation"]'),
-    "tower": ("📡 Вышка/мачта", 'nwr["man_made"~"^(tower|mast|communications_tower)$"]'),
-    "water_tower": ("🗼 Водонапорная башня", 'nwr["man_made"="water_tower"]'),
-    "chimney": ("🏭 Труба", 'nwr["man_made"="chimney"]'),
-    "wind": ("🌬 Ветряк", 'nwr["generator:source"="wind"]'),
-    "lighthouse": ("🗼 Маяк", 'nwr["man_made"="lighthouse"]'),
-    "stadium": ("🏟 Стадион", 'nwr["leisure"="stadium"]'),
-    "school": ("🏫 Школа", 'nwr["amenity"="school"]'),
-    "hospital": ("🏥 Больница", 'nwr["amenity"="hospital"]'),
-    "pharmacy": ("💊 Аптека", 'nwr["amenity"="pharmacy"]'),
-    "supermarket": ("🛒 Супермаркет", 'nwr["shop"="supermarket"]'),
-    "mcdonalds": ("🍔 McDonald's", 'nwr["brand:wikidata"="Q38076"]'),
-    "playground": ("🛝 Детская площадка", 'nwr["leisure"="playground"]'),
-    "cemetery": ("🪦 Кладбище", 'nwr["landuse"="cemetery"]'),
-    "park": ("🌳 Парк", 'nwr["leisure"="park"]'),
-    "castle": ("🏰 Замок/крепость", 'nwr["historic"~"^(castle|fort)$"]'),
-    "monument": ("🗿 Памятник", 'nwr["historic"~"^(monument|memorial)$"]'),
-    "fountain": ("⛲ Фонтан", 'nwr["amenity"="fountain"]'),
-    "airport": ("✈ Аэродром", 'nwr["aeroway"="aerodrome"]'),
-    "helipad": ("🚁 Вертолётная площадка", 'nwr["aeroway"="helipad"]'),
-    "port": ("⚓ Порт/причал", 'nwr["harbour"="yes"];nwr["man_made"="pier"]'),
-    "peak": ("⛰ Вершина", 'node["natural"="peak"]'),
-    "bus_stop": ("🚏 Остановка", 'node["highway"="bus_stop"]'),
-    "parking": ("🅿 Парковка", 'nwr["amenity"="parking"]'),
+    "church": ("Церковь", 'nwr["amenity"="place_of_worship"]["religion"="christian"]'),
+    "mosque": ("Мечеть", 'nwr["amenity"="place_of_worship"]["religion"="muslim"]'),
+    "temple": ("Храм (любой)", 'nwr["amenity"="place_of_worship"]'),
+    "river": ("Река", 'way["waterway"="river"]'),
+    "canal": ("Канал", 'way["waterway"="canal"]'),
+    "lake": ("Озеро/пруд", 'nwr["natural"="water"]'),
+    "beach": ("Пляж", 'nwr["natural"="beach"]'),
+    "railway": ("Железная дорога", 'way["railway"="rail"]'),
+    "station": ("Ж/д станция", 'nwr["railway"~"^(station|halt)$"]'),
+    "tram": ("Трамвайные пути", 'way["railway"="tram"]'),
+    "bridge": ("Мост", 'way["bridge"="yes"]["highway"]'),
+    "motorway": ("Автомагистраль", 'way["highway"~"^(motorway|trunk)$"]'),
+    "roundabout": ("Круговое движение", 'way["junction"="roundabout"]'),
+    "fuel": ("Заправка", 'nwr["amenity"="fuel"]'),
+    "power_line": ("ЛЭП", 'way["power"="line"]'),
+    "substation": ("Подстанция", 'nwr["power"="substation"]'),
+    "tower": ("Вышка/мачта", 'nwr["man_made"~"^(tower|mast|communications_tower)$"]'),
+    "water_tower": ("Водонапорная башня", 'nwr["man_made"="water_tower"]'),
+    "chimney": ("Труба", 'nwr["man_made"="chimney"]'),
+    "wind": ("Ветряк", 'nwr["generator:source"="wind"]'),
+    "lighthouse": ("Маяк", 'nwr["man_made"="lighthouse"]'),
+    "stadium": ("Стадион", 'nwr["leisure"="stadium"]'),
+    "school": ("Школа", 'nwr["amenity"="school"]'),
+    "hospital": ("Больница", 'nwr["amenity"="hospital"]'),
+    "pharmacy": ("Аптека", 'nwr["amenity"="pharmacy"]'),
+    "supermarket": ("Супермаркет", 'nwr["shop"="supermarket"]'),
+    "mcdonalds": ("McDonald's", 'nwr["brand:wikidata"="Q38076"]'),
+    "playground": ("Детская площадка", 'nwr["leisure"="playground"]'),
+    "cemetery": ("Кладбище", 'nwr["landuse"="cemetery"]'),
+    "park": ("Парк", 'nwr["leisure"="park"]'),
+    "castle": ("Замок/крепость", 'nwr["historic"~"^(castle|fort)$"]'),
+    "monument": ("Памятник", 'nwr["historic"~"^(monument|memorial)$"]'),
+    "fountain": ("Фонтан", 'nwr["amenity"="fountain"]'),
+    "airport": ("Аэродром", 'nwr["aeroway"="aerodrome"]'),
+    "helipad": ("Вертолётная площадка", 'nwr["aeroway"="helipad"]'),
+    "port": ("Порт/причал", 'nwr["harbour"="yes"];nwr["man_made"="pier"]'),
+    "peak": ("Вершина", 'node["natural"="peak"]'),
+    "bus_stop": ("Остановка", 'node["highway"="bus_stop"]'),
+    "parking": ("Парковка", 'nwr["amenity"="parking"]'),
 }
 OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
 

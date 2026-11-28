@@ -1133,7 +1133,7 @@ def ai_case_payload(store, case):
 
 def ai_summary(store, case, api_key, model="claude-opus-5-5", proxy=""):
     if not api_key:
-        raise ValueError("Добавьте ключ Anthropic API в настройках (⚙ → Claude API)")
+        raise ValueError("Добавьте ключ Anthropic API в настройках (Настройки → Claude API)")
     try:
         import anthropic
     except ImportError:

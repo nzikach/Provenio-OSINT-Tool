@@ -38,7 +38,7 @@ import urllib.error
 from html.parser import HTMLParser
 
 APP_NAME = "Provenio"
-APP_VERSION = "2.6.0"
+APP_VERSION = "3.0.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 # каталог с ресурсами (в exe PyInstaller распаковывает их во временную папку)
@@ -1441,10 +1441,10 @@ def build_report(store, case):
     chain_ok, broken = store.verify_audit()
     e = html.escape
     rows_s = "".join(
-        f"<tr><td>{s['id']}</td><td>{'🛠 ' if s.get('kind') == 'tool' else ''}{e(s['url'])}"
+        f"<tr><td>{s['id']}</td><td>{'инструмент: ' if s.get('kind') == 'tool' else ''}{e(s['url'])}"
         f"{' (версия источника #' + str(s['parent_id']) + ')' if s.get('parent_id') else ''}"
         f"<br><small>{e(s['title'])}</small>"
-        + "".join(f"<br><small>📎 {e(a['kind'])}: {e(a['file'])} · sha256 <code>{e(a['sha256'])}</code></small>"
+        + "".join(f"<br><small>{e(a['kind'])}: {e(a['file'])} · sha256 <code>{e(a['sha256'])}</code></small>"
                   for a in atts.get(s["id"], [])) + "</td>"
         f"<td>{e(s['fetched'])}</td><td>{e(s['status'])}</td><td>{s['reliability']}/5</td>"
         f"<td><code>{e(s['sha256'])}</code></td><td>{e(s['note'])}</td></tr>" for s in srcs)

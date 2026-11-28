@@ -1017,7 +1017,7 @@ class CTStream:
                     found = True
                     if self.notify:
                         try:
-                            self.notify(f"🔴 CT: новый сертификат для «{', '.join(rec['domains'][:3])}» (ключ «{rec['keyword']}»)")
+                            self.notify(f"CT: новый сертификат для «{', '.join(rec['domains'][:3])}» (ключ «{rec['keyword']}»)")
                         except Exception:
                             pass
         if found:
@@ -1076,7 +1076,7 @@ class RansomWatch:
                 fresh = [i for i in items if f"{i['group']}|{i['victim']}|{i['attackdate']}" not in seen]
                 if seen and fresh and self.notify:
                     for i in fresh[:5]:
-                        self.notify(f"☠ Вымогатели: «{i['victim']}» на сайте группы {i['group']} (ключ «{kw}»)")
+                        self.notify(f"Вымогатели: «{i['victim']}» на сайте группы {i['group']} (ключ «{kw}»)")
                 new += fresh if seen else []
                 self.cfg["seen"][kw] = sorted(seen | {f"{i['group']}|{i['victim']}|{i['attackdate']}" for i in items})[-2000:]
             self.cfg["last"] = time.time()

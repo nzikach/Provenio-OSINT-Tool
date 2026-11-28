@@ -25,23 +25,31 @@ def copy_sources():
     shutil.copytree(os.path.join(ROOT, "legal"), os.path.join(APP, "legal"), dirs_exist_ok=True)
 
 
+def mark(u, v):
+    """Буква P знака Provenio в координатах 0..1: ствол и чаша."""
+    if 0.31 <= u <= 0.43 and 0.22 <= v <= 0.78:
+        return True
+    outer = (0.31 <= u <= 0.52 and 0.22 <= v <= 0.60) or (u >= 0.52 and (u - 0.52) ** 2 + (v - 0.41) ** 2 <= 0.19 ** 2)
+    hole = (0.43 <= u <= 0.52 and 0.33 <= v <= 0.49) or (u >= 0.52 and (u - 0.52) ** 2 + (v - 0.41) ** 2 <= 0.08 ** 2)
+    return outer and not hole
+
+
+def ink(x, y, size):
+    """Доля пикселя, покрытая буквой (сглаживание по 4 или 16 точкам)."""
+    n = 2 if size > 256 else 4
+    hit = sum(mark((x + (i + .5) / n) / size, (y + (j + .5) / n) / size) for i in range(n) for j in range(n))
+    return hit / (n * n)
+
+
 def png(size):
-    """Квадратная непрозрачная иконка (углы скругляет сама iOS): градиент + ромб ◈."""
+    """Квадратная непрозрачная иконка (углы скругляет сама iOS): белый фон и чёрная буква P."""
     rows = []
     for y in range(size):
         row = bytearray([0])
         for x in range(size):
-            t = (x + y) / (2 * size)
-            r = int(0x8b + (0xe8 - 0x8b) * t)
-            g = int(0x5c + (0x79 - 0x5c) * t)
-            b = int(0xf6 + (0xf9 - 0xf6) * t)
-            u, v = abs(x + .5 - size / 2), abs(y + .5 - size / 2)
-            m = (u + v) / (size / 2)
-            if 0.40 < m < 0.51 or m < 0.23:
-                r, g, b = 255, 255, 255
-            row += bytes([r, g, b])
+            c = int(0xf2 + (0x0a - 0xf2) * ink(x, y, size))
+            row += bytes([c, c, c])
         rows.append(bytes(row))
-
     def chunk(tag, data):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
