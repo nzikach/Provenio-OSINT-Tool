@@ -33,6 +33,13 @@ import provenio_lan as LANM  # 2.6: интерфейс на телефоне ч�
 import provenio_unique as UQ  # 2.5: якоря OpenTimestamps, свидетель, атрибуция, геопазл, самоаудит, ритм жизни
 import hashlib
 
+# Консоль Windows бывает в cp1252: кириллица в print() не должна ронять программу.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 S = P.Store()
 LOCK = S.lock
 TOKEN = secrets.token_urlsafe(24)       # токен страницы: до входа открывает только вход/регистрацию и документы
